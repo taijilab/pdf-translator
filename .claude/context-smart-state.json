@@ -1,0 +1,10 @@
+{
+  "accumulated_tokens": 76380,
+  "usage_percent": 38,
+  "last_update": "2026-02-19T19:08:52+08:00",
+  "thresholds": {
+    "hint": 70,
+    "warning": 85,
+    "critical": 95
+  }
+}

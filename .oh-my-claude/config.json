@@ -1,0 +1,36 @@
+{
+  "projectType": "python-flask",
+  "framework": "Flask",
+  "language": "Python",
+  "description": "PDF翻译Web应用",
+  "createdAt": "2026-02-18",
+
+  "preferences": {
+    "testFramework": "pytest",
+    "linter": "ruff",
+    "formatter": "black",
+    "typeChecker": "mypy"
+  },
+
+  "agentPreferences": {
+    "defaultCoder": "luban",
+    "defaultReviewer": "weizheng",
+    "defaultTester": "baozheng",
+    "defaultArchitect": "zhuge"
+  },
+
+  "conventions": {
+    "fileNaming": "snake_case",
+    "maxFileLines": 300,
+    "docstringStyle": "google",
+    "importOrder": ["stdlib", "third-party", "local"],
+    "routeStyle": "RESTful"
+  },
+
+  "techStack": {
+    "web": "Flask 3.0",
+    "pdf": "PyMuPDF",
+    "translation": "googletrans",
+    "frontend": ["HTML", "CSS", "JavaScript"]
+  }
+}
