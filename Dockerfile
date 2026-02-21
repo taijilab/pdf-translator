@@ -19,4 +19,6 @@ RUN mkdir -p /tmp/pdf_translator
 
 EXPOSE 5001
 
-CMD ["gunicorn", "--bind", "0.0.0.0:5001", "--workers", "2", "--timeout", "300", "--keep-alive", "5", "app:app"]
+# 必须单进程（--workers 1）：progress_queues/cancel_flags 存在内存中，
+# 多进程会导致 SSE 进度流找不到队列。用 --threads 处理并发请求。
+CMD ["gunicorn", "--bind", "0.0.0.0:5001", "--workers", "1", "--threads", "8", "--timeout", "0", "--keep-alive", "5", "app:app"]
