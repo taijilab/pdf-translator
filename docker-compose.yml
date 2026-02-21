@@ -1,0 +1,17 @@
+services:
+  pdf-translator:
+    image: ${DOCKER_IMAGE:-pdf-translator:latest}
+    container_name: pdf-translator
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    environment:
+      - PYTHONUNBUFFERED=1
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5001/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
