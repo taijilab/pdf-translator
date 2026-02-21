@@ -44,6 +44,7 @@ class PDFTranslator:
         self.input_tokens = 0
         self.output_tokens = 0
         self.translator = None  # 初始化为None
+        self._translation_cache = {}  # 翻译缓存：(text, src, tgt) -> translated
 
         # 只在需要时初始化translator
         if self.api_type == 'google':
@@ -54,6 +55,38 @@ class PDFTranslator:
         # deep-translator 不需要预先设置translator实例
         pass
 
+    def _group_short_blocks(self, all_blocks, max_group_chars=800, short_threshold=150):
+        """将连续短文本块合并成批次，减少 API 调用次数。
+        返回 list of ('single'|'batch', [block_info, ...])。"""
+        SEPARATOR = "\n---SPLIT---\n"
+        sep_len = len(SEPARATOR)
+        groups = []
+        current_group = []
+        current_len = 0
+
+        for block in all_blocks:
+            text_len = len(block['text'].strip())
+            if text_len >= short_threshold:
+                # 长文本块：先把当前积累的短块入队，再单独处理
+                if current_group:
+                    groups.append(('batch', current_group))
+                    current_group, current_len = [], 0
+                groups.append(('single', [block]))
+            else:
+                # 短文本块：尝试合并到当前批次
+                added_len = text_len + (sep_len if current_group else 0)
+                if current_group and current_len + added_len > max_group_chars:
+                    groups.append(('batch', current_group))
+                    current_group, current_len = [], 0
+                    added_len = text_len
+                current_group.append(block)
+                current_len += added_len
+
+        if current_group:
+            groups.append(('batch', current_group))
+
+        return groups
+
     def analyze_pdf(self, input_path):
         """分析PDF文件，返回页数、字数、语言等信息"""
         try:
@@ -61,10 +94,11 @@ class PDFTranslator:
             total_pages = len(doc)
 
             # 提取所有文本
-            all_text = ""
+            parts = []
             for page in doc:
                 text = page.get_text("text")
-                all_text += text + " "
+                parts.append(text)
+            all_text = " ".join(parts)
 
             doc.close()
 
@@ -857,134 +891,205 @@ class PDFTranslator:
             total_blocks = len(all_blocks)
             self._add_log(f'总共提取到 {total_blocks} 个文本块', 'info')
 
-            # 显示每个文本块的原文（按页分组）
-            # 只显示前3页和后3页的原文，避免日志过多
-            self._add_log('=' * 60, 'info')
-            self._add_log('原文提取（前3页和后3页）：', 'info')
-            current_page = -1
-            for block_info in all_blocks:
-                page_num = block_info['page_num']
-                # 只显示前3页和后3页
-                if page_num >= 3 and page_num < total_pages - 3:
-                    if current_page != page_num:
-                        current_page = page_num
-                        self._add_log(f'--- 第 {page_num + 1} 页（已跳过） ---', 'info')
-                    continue
-
-                if block_info['page_num'] != current_page:
-                    current_page = block_info['page_num']
-                    self._add_log(f'--- 第 {current_page + 1} 页 ---', 'info')
-
-                text = block_info['text']
-                display_text = text[:200] + '...' if len(text) > 200 else text
-                # 使用前端期望的格式：[文本块 X] 原文: ... (带页码)
-                self._add_log(f'[页{block_info["page_num"] + 1}|文本块 {block_info["block_idx"] + 1}] 原文: {display_text}', 'info')
-
             # 并发翻译所有文本块
             self._add_log('=' * 60, 'info')
             self._add_log('开始翻译...', 'info')
 
+            # 将短文本块合并成批次，减少 API 调用次数
+            groups = self._group_short_blocks(all_blocks)
+            batch_count = sum(1 for t, _ in groups if t == 'batch' and len(_) > 1)
+            single_count = len(groups) - batch_count
+            self._add_log(f'文本块分组完成：{single_count} 个单独翻译，{batch_count} 个批次合并翻译', 'info')
+
             results = {}
             completed_count = [0]
             lock = threading.Lock()
+            BATCH_SEPARATOR = "\n---SPLIT---\n"
 
-            def translate_block(block_info):
-                """翻译单个文本块"""
-                max_retries = 3
-                translated = None
+            def _calc_remaining(elapsed, done, total):
+                if done <= 0:
+                    return 0
+                return (elapsed / done) * (total - done)
+
+            def translate_unit(unit):
+                """翻译一个工作单元（单块或批次短文本块）"""
+                group_type, blocks = unit
                 api_start_time = time.time()
+
+                # ---- 批次翻译（多个短文本块合并为一次 API 调用） ----
+                if group_type == 'batch' and len(blocks) > 1:
+                    texts = [self._clean_text(b['text']) for b in blocks]
+                    combined = BATCH_SEPARATOR.join(texts)
+
+                    # 先记录所有原文日志
+                    with lock:
+                        base_num = completed_count[0]
+                        for i, text in enumerate(texts):
+                            display = text[:200] + '...' if len(text) > 200 else text
+                            self._add_log(f'[原文 {base_num + i + 1}/{total_blocks}] {display}', 'info')
+
+                    try:
+                        self._check_cancelled()
+                        input_tokens = self._estimate_tokens(combined)
+
+                        if self.api_type == 'google':
+                            combined_translated = GoogleTranslator(
+                                source=normalized_source, target=normalized_target
+                            ).translate(combined)
+                        else:
+                            combined_translated = self._translate_text(combined, source_lang, target_lang)
+
+                        api_time = time.time() - api_start_time
+                        output_tokens = self._estimate_tokens(combined_translated)
+
+                        # 拆分结果；如数量不匹配则降级为原文
+                        parts = combined_translated.split(BATCH_SEPARATOR)
+                        if len(parts) != len(blocks):
+                            print(f'[WARN] 批次拆分不匹配: 期望 {len(blocks)}, 实际 {len(parts)}，使用原文回退')
+                            parts = texts
+
+                        with lock:
+                            base_num = completed_count[0]
+                            for i, (block, translated) in enumerate(zip(blocks, parts)):
+                                display = translated[:200] + '...' if len(translated) > 200 else translated
+                                self._add_log(
+                                    f'[译文 {base_num + i + 1}/{total_blocks}] {display} (耗时: {api_time:.1f}s)',
+                                    'success'
+                                )
+                                cache_key = (texts[i], source_lang, target_lang)
+                                self._translation_cache[cache_key] = translated
+
+                            self.input_tokens += input_tokens
+                            self.output_tokens += output_tokens
+                            completed_count[0] += len(blocks)
+
+                            elapsed_time = time.time() - translation_start_time
+                            current = completed_count[0]
+                            est_remaining = _calc_remaining(elapsed_time, current, total_blocks)
+                            self._update_progress(
+                                current, total_blocks,
+                                f'已翻译 {current}/{total_blocks} 个文本块...',
+                                elapsed_time=elapsed_time, estimated_remaining=est_remaining
+                            )
+
+                        return [(b, t) for b, t in zip(blocks, parts)]
+
+                    except Exception as e:
+                        print(f'批次翻译失败: {e}')
+                        with lock:
+                            completed_count[0] += len(blocks)
+                            elapsed_time = time.time() - translation_start_time
+                            current = completed_count[0]
+                            est_remaining = _calc_remaining(elapsed_time, current, total_blocks)
+                            self._update_progress(
+                                current, total_blocks,
+                                f'已翻译 {current}/{total_blocks} 个文本块...',
+                                elapsed_time=elapsed_time, estimated_remaining=est_remaining
+                            )
+                        return [(b, b['text']) for b in blocks]
+
+                # ---- 单块翻译 ----
+                block_info = blocks[0]
+                max_retries = 3
 
                 for attempt in range(max_retries):
                     try:
                         self._check_cancelled()
-
                         text = self._clean_text(block_info['text'])
 
-                        # 在翻译前发送原文日志（前端期望格式: [原文 序号/总数] 内容）
-                        with lock:
-                            current = completed_count[0] + 1
-                            display_original = text[:200] + '...' if len(text) > 200 else text
-                            self._add_log(f'[原文 {current}/{total_blocks}] {display_original}', 'info')
+                        # 检查缓存
+                        cache_key = (text, source_lang, target_lang)
+                        if cache_key in self._translation_cache:
+                            translated = self._translation_cache[cache_key]
+                            with lock:
+                                current_num = completed_count[0] + 1
+                                display_orig = text[:200] + '...' if len(text) > 200 else text
+                                display_trans = translated[:200] + '...' if len(translated) > 200 else translated
+                                self._add_log(f'[原文 {current_num}/{total_blocks}] {display_orig}', 'info')
+                                self._add_log(f'[译文 {current_num}/{total_blocks}] {display_trans} (缓存命中)', 'success')
+                                completed_count[0] += 1
+                                elapsed_time = time.time() - translation_start_time
+                                current = completed_count[0]
+                                est_remaining = _calc_remaining(elapsed_time, current, total_blocks)
+                                self._update_progress(
+                                    current, total_blocks,
+                                    f'已翻译 {current}/{total_blocks} 个文本块...',
+                                    elapsed_time=elapsed_time, estimated_remaining=est_remaining
+                                )
+                            return [(block_info, translated)]
 
-                        # 记录输入token
+                        with lock:
+                            current_num = completed_count[0] + 1
+                            display_original = text[:200] + '...' if len(text) > 200 else text
+                            self._add_log(f'[原文 {current_num}/{total_blocks}] {display_original}', 'info')
+
                         input_tokens = self._estimate_tokens(text)
 
-                        # 翻译
                         if self.api_type == 'google':
-                            translated = GoogleTranslator(source=normalized_source, target=normalized_target).translate(text)
+                            translated = GoogleTranslator(
+                                source=normalized_source, target=normalized_target
+                            ).translate(text)
                         else:
                             translated = self._translate_text(text, source_lang, target_lang)
 
-                        # 记录输出token
                         output_tokens = self._estimate_tokens(translated)
                         api_time = time.time() - api_start_time
 
                         with lock:
-                            # 发送译文日志（前端期望格式: [译文 序号/总数] 内容 (耗时: Xs)）
                             display_translated = translated[:200] + '...' if len(translated) > 200 else translated
-                            self._add_log(f'[译文 {current}/{total_blocks}] {display_translated} (耗时: {api_time:.1f}s)', 'success')
-
+                            self._add_log(
+                                f'[译文 {current_num}/{total_blocks}] {display_translated} (耗时: {api_time:.1f}s)',
+                                'success'
+                            )
                             self.input_tokens += input_tokens
                             self.output_tokens += output_tokens
+                            self._translation_cache[cache_key] = translated
                             completed_count[0] += 1
 
-                            # 更新进度
                             elapsed_time = time.time() - translation_start_time
                             current = completed_count[0]
+                            est_remaining = _calc_remaining(elapsed_time, current, total_blocks)
                             self._update_progress(
-                                current,
-                                total_blocks,
+                                current, total_blocks,
                                 f'已翻译 {current}/{total_blocks} 个文本块...',
-                                elapsed_time=elapsed_time,
-                                estimated_remaining=0
+                                elapsed_time=elapsed_time, estimated_remaining=est_remaining
                             )
 
-                        return block_info, translated
+                        return [(block_info, translated)]
 
                     except Exception as e:
                         print(f'Translation error for block {block_info["block_idx"]} (attempt {attempt + 1}): {e}')
-
                         if attempt == max_retries - 1:
-                            error_msg = str(e)
                             with lock:
                                 completed_count[0] += 1
                                 elapsed_time = time.time() - translation_start_time
+                                current = completed_count[0]
+                                est_remaining = _calc_remaining(elapsed_time, current, total_blocks)
                                 self._update_progress(
-                                    completed_count[0],
-                                    total_blocks,
-                                    f'已翻译 {completed_count[0]}/{total_blocks} 个文本块...',
-                                    elapsed_time=elapsed_time,
-                                    estimated_remaining=0
+                                    current, total_blocks,
+                                    f'已翻译 {current}/{total_blocks} 个文本块...',
+                                    elapsed_time=elapsed_time, estimated_remaining=est_remaining
                                 )
-                            return block_info, block_info['text']
+                            return [(block_info, block_info['text'])]
                         else:
-                            time.sleep(0.5)
+                            time.sleep(0.5 * (2 ** attempt))  # 指数退避
 
-            # 使用用户设置的并发数翻译
+            # 使用用户设置的并发数翻译（以 group 为并发单元）
             with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = {executor.submit(translate_block, block): block for block in all_blocks}
+                futures = {executor.submit(translate_unit, group): group for group in groups}
 
                 for future in concurrent.futures.as_completed(futures):
                     try:
-                        block_info, translated_text = future.result()
-                        results[(block_info['page_num'], block_info['block_idx'])] = (block_info['rect'], translated_text)
-
-                        # 每完成一定数量显示日志
-                        if completed_count[0] % 20 == 0 or completed_count[0] >= total_blocks - 10:
-                            self._add_log(f'进度: {completed_count[0]}/{total_blocks} 文本块已翻译', 'info')
-
+                        block_results = future.result()
+                        for block_info, translated_text in block_results:
+                            results[(block_info['page_num'], block_info['block_idx'])] = (
+                                block_info['rect'], translated_text
+                            )
                     except Exception as e:
                         print(f'Future error: {e}')
 
             self._add_log(f'✓ 所有文本块翻译完成', 'success')
-
-            # 调试：检查results字典
-            self._add_log(f'[DEBUG] results字典包含 {len(results)} 个翻译结果', 'info')
-            # 显示前几个results的key
-            for i, (key, value) in enumerate(list(results.items())[:3]):
-                page_num, block_idx = key
-                rect, text = value
-                self._add_log(f'[DEBUG] results[({page_num},{block_idx})]: rect={rect}, 文本长度={len(text)}', 'info')
+            print(f'[DEBUG] results字典包含 {len(results)} 个翻译结果')
 
             # 按页组织翻译结果并显示
             # 只显示前3页和后3页的译文，避免日志过多
@@ -1031,11 +1136,7 @@ class PDFTranslator:
             self._add_log('正在将译文写回PDF...', 'info')
             self._add_log('将彻底移除原文并插入翻译，保留图片和排版格式', 'info')
 
-            # 调试：检查page_translations_map
-            self._add_log(f'[DEBUG] page_translations_map包含 {len(page_translations_map)} 页', 'info')
-            for page_num, translations in list(page_translations_map.items())[:3]:  # 只显示前3页
-                self._add_log(f'[DEBUG] 第{page_num + 1}页有 {len(translations)} 个翻译', 'info')
-
+            print(f'[DEBUG] page_translations_map包含 {len(page_translations_map)} 页')
             total_written = 0
 
             # 方法：创建新文档，复制原页面的图片和图形，然后只添加翻译后的文本
@@ -1070,29 +1171,16 @@ class PDFTranslator:
                 # 复制原页面的所有图片
                 try:
                     image_list = page.get_images()
-                    self._add_log(f'[DEBUG] 第{page_num+1}页有 {len(image_list)} 张图片', 'info')
-
                     for img_index, img in enumerate(image_list):
                         try:
                             xref = img[0]
-                            # 获取图片在页面上的位置
                             img_rects = page.get_image_rects(xref)
                             for img_rect in img_rects:
-                                # 在新页面上绘制图片
                                 new_page.insert_image(img_rect, pixmap=fitz.Pixmap(doc, xref))
                         except Exception as img_err:
-                            self._add_log(f'[DEBUG] 图片复制失败: {str(img_err)[:50]}', 'info')
+                            print(f'[DEBUG] 图片复制失败(页{page_num+1}): {str(img_err)[:50]}')
                 except Exception as e:
-                    self._add_log(f'[DEBUG] 图片处理出错: {str(e)[:50]}', 'info')
-
-                # 复制原页面的图形（线条、形状等）
-                try:
-                    # 获取页面的绘图内容
-                    # 使用 get_text("rawdict") 或其他方法获取图形信息
-                    # 这里我们简单使用 page.get_svg_image() 来获取所有视觉元素
-                    pass
-                except Exception as e:
-                    self._add_log(f'[DEBUG] 图形处理出错: {str(e)[:50]}', 'info')
+                    print(f'[DEBUG] 图片处理出错(页{page_num+1}): {str(e)[:50]}')
 
                 if not page_translations:
                     if page_num < 3 or page_num >= total_pages - 3:
@@ -1101,18 +1189,11 @@ class PDFTranslator:
 
                 if page_num < 3 or page_num >= total_pages - 3:
                     self._add_log(f'更新第 {page_num + 1} 页（{len(page_translations)} 个文本块）...', 'info')
-                    # 调试：显示第一个文本块的信息
-                    if page_translations:
-                        first_rect, first_text = page_translations[0]
-                        self._add_log(f'[DEBUG] 第一个文本块: rect={first_rect}, 文本长度={len(first_text)}', 'info')
-                        self._add_log(f'[DEBUG] 文本预览: {first_text[:100]}', 'info')
 
                 # 更新这一页的内容
                 success_count = 0
                 for idx, (text_rect, translated_text) in enumerate(page_translations):
                     try:
-                        self._add_log(f'[DEBUG] 开始写入第{page_num+1}页块{idx+1}: rect=({text_rect.x0:.1f},{text_rect.y0:.1f},{text_rect.x1:.1f},{text_rect.y1:.1f}), 文本长度={len(translated_text)}', 'info')
-
                         # 写入翻译文本
                         try:
                             # 使用 fitz 的内置中文支持
@@ -1128,9 +1209,8 @@ class PDFTranslator:
                             if result >= 0:
                                 success_count += 1
                                 total_written += 1
-                                self._add_log(f'[DEBUG] 文本块写入成功，字符数: {result}', 'info')
                             else:
-                                self._add_log(f'[DEBUG] 文本块写入失败，返回值: {result}', 'error')
+                                print(f'[DEBUG] 文本块写入失败，返回值: {result}')
 
                         except Exception as text_err:
                             # 备用方案：尝试其他中文字体名称
@@ -1150,14 +1230,13 @@ class PDFTranslator:
                                     if result >= 0:
                                         success_count += 1
                                         total_written += 1
-                                        self._add_log(f'[DEBUG] 使用字体 {font_name} 写入成功', 'info')
                                         font_success = True
                                         break
                                 except:
                                     continue
 
                             if not font_success:
-                                self._add_log(f'[DEBUG] 所有字体尝试失败: {str(text_err)[:50]}', 'error')
+                                print(f'[DEBUG] 所有字体尝试失败: {str(text_err)[:50]}')
 
                     except Exception as e:
                         print(f'Insert textbox error on page {page_num + 1}: {e}')
@@ -1170,12 +1249,14 @@ class PDFTranslator:
 
                 # 更新进度
                 elapsed_time = time.time() - translation_start_time
+                done_pages = page_num + 1
+                est_remaining = _calc_remaining(elapsed_time, done_pages, total_pages)
                 self._update_progress(
-                    page_num + 1,
+                    done_pages,
                     total_pages,
-                    f'已写入 {page_num + 1}/{total_pages} 页',
+                    f'已写入 {done_pages}/{total_pages} 页',
                     elapsed_time=elapsed_time,
-                    estimated_remaining=0
+                    estimated_remaining=est_remaining
                 )
 
             # 关闭原文档
@@ -1338,12 +1419,14 @@ class PDFTranslator:
                     # 更新进度
                     elapsed_time = time.time() - translation_start_time
                     current = completed_count[0]
+                    total_chunks = len(text_chunks)
+                    est_remaining = (elapsed_time / current) * (total_chunks - current) if current > 0 else 0
                     self._update_progress(
                         current,
-                        len(text_chunks),
-                        f'已翻译 {current}/{len(text_chunks)} 个文本块...',
+                        total_chunks,
+                        f'已翻译 {current}/{total_chunks} 个文本块...',
                         elapsed_time=elapsed_time,
-                        estimated_remaining=0
+                        estimated_remaining=est_remaining
                     )
 
                     # 记录翻译结果
