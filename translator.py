@@ -942,11 +942,22 @@ class PDFTranslator:
                         api_time = time.time() - api_start_time
                         output_tokens = self._estimate_tokens(combined_translated)
 
-                        # 拆分结果；如数量不匹配则降级为原文
+                        # 拆分结果；如数量不匹配则逐一翻译（不回退原文）
                         parts = combined_translated.split(BATCH_SEPARATOR)
                         if len(parts) != len(blocks):
-                            print(f'[WARN] 批次拆分不匹配: 期望 {len(blocks)}, 实际 {len(parts)}，使用原文回退')
-                            parts = texts
+                            print(f'[WARN] 批次拆分不匹配: 期望 {len(blocks)}, 实际 {len(parts)}，逐一翻译回退')
+                            parts = []
+                            for t in texts:
+                                try:
+                                    if self.api_type == 'google':
+                                        tr = GoogleTranslator(
+                                            source=normalized_source, target=normalized_target
+                                        ).translate(t)
+                                    else:
+                                        tr = self._translate_text(t, source_lang, target_lang)
+                                    parts.append(tr if tr else t)
+                                except Exception:
+                                    parts.append(t)
 
                         with lock:
                             base_num = completed_count[0]
@@ -1192,56 +1203,74 @@ class PDFTranslator:
 
                 # 更新这一页的内容
                 success_count = 0
+                page_bottom = new_page.rect.height - 5
+
                 for idx, (text_rect, translated_text) in enumerate(page_translations):
                     try:
-                        # 写入翻译文本
-                        try:
-                            # 使用 fitz 的内置中文支持
-                            result = new_page.insert_textbox(
-                                text_rect,
-                                translated_text,
-                                fontsize=11,
-                                fontname="china-s",  # 使用简体中文字体
-                                color=(0, 0, 0),
-                                align=0
-                            )
+                        written = False
+                        font_names = ["china-s", "china-t", "helv", "china-ss"]
 
-                            if result >= 0:
-                                success_count += 1
-                                total_written += 1
-                            else:
-                                print(f'[DEBUG] 文本块写入失败，返回值: {result}')
-
-                        except Exception as text_err:
-                            # 备用方案：尝试其他中文字体名称
-                            font_names = ["china-t", "china-ss", "cjk", "song"]
-                            font_success = False
-
-                            for font_name in font_names:
+                        for font_name in font_names:
+                            # 逐步缩小字体尝试放入原矩形
+                            for fontsize in [11, 9, 7, 6]:
                                 try:
                                     result = new_page.insert_textbox(
                                         text_rect,
                                         translated_text,
-                                        fontsize=11,
+                                        fontsize=fontsize,
                                         fontname=font_name,
                                         color=(0, 0, 0),
                                         align=0
                                     )
                                     if result >= 0:
-                                        success_count += 1
-                                        total_written += 1
-                                        font_success = True
+                                        written = True
                                         break
-                                except:
+                                except Exception:
+                                    break  # 该字体不可用，换下一个
+                            if written:
+                                break
+
+                            # 原矩形装不下：扩展到页面底部再试
+                            if not written:
+                                try:
+                                    extended_rect = fitz.Rect(
+                                        text_rect.x0, text_rect.y0,
+                                        text_rect.x1, max(text_rect.y1, page_bottom)
+                                    )
+                                    result = new_page.insert_textbox(
+                                        extended_rect,
+                                        translated_text,
+                                        fontsize=6,
+                                        fontname=font_name,
+                                        color=(0, 0, 0),
+                                        align=0
+                                    )
+                                    if result >= 0:
+                                        written = True
+                                        break
+                                except Exception:
                                     continue
 
-                            if not font_success:
-                                print(f'[DEBUG] 所有字体尝试失败: {str(text_err)[:50]}')
+                        if written:
+                            success_count += 1
+                            total_written += 1
+                        else:
+                            # 最后兜底：在矩形起点强制插入单行文本，避免丢失
+                            try:
+                                new_page.insert_text(
+                                    (text_rect.x0, text_rect.y0 + 10),
+                                    translated_text,
+                                    fontsize=6,
+                                    fontname="helv",
+                                    color=(0, 0, 0)
+                                )
+                                success_count += 1
+                                total_written += 1
+                            except Exception as fallback_err:
+                                print(f'[DEBUG] 块{idx+1}最终回退也失败: {str(fallback_err)[:60]}')
 
                     except Exception as e:
                         print(f'Insert textbox error on page {page_num + 1}: {e}')
-                        import traceback
-                        traceback.print_exc()
                         self._add_log(f'⚠️ 第{page_num + 1}页块{idx + 1}写入失败: {str(e)[:100]}', 'error')
 
                 if page_num < 3 or page_num >= total_pages - 3:
