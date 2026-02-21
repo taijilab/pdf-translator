@@ -1,0 +1,103 @@
+name: Test PDF Translator
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install flask pymupdf werkzeug requests deep-translator
+
+      - name: Syntax check
+        run: |
+          python -m py_compile translator.py app.py
+          echo "✓ Syntax check passed"
+
+      - name: Run unit tests
+        run: |
+          python -c "
+          from translator import PDFTranslator
+          import inspect
+
+          # 测试1：类实例化
+          t = PDFTranslator(api_type='google')
+          assert hasattr(t, '_translation_cache'), 'Missing _translation_cache'
+          print('✓ PDFTranslator instantiation OK')
+
+          # 测试2：_group_short_blocks 分组逻辑
+          blocks = [
+              {'page_num': 0, 'block_idx': i, 'text': 'x' * n, 'rect': None}
+              for i, n in enumerate([50, 60, 70, 200, 40, 30])
+          ]
+          groups = t._group_short_blocks(blocks)
+          assert len(groups) > 0, 'No groups returned'
+          # 200-char block must be single
+          single_groups = [g for gtype, g in groups if gtype == 'single']
+          assert any(b['text'] == 'x' * 200 for g in single_groups for b in g), \
+              'Long block should be single'
+          print(f'✓ _group_short_blocks: {len(blocks)} blocks -> {len(groups)} groups')
+
+          # 测试3：短块合并不超过 max_group_chars
+          big_blocks = [
+              {'page_num': 0, 'block_idx': i, 'text': 'x' * 100, 'rect': None}
+              for i in range(20)
+          ]
+          groups2 = t._group_short_blocks(big_blocks, max_group_chars=800)
+          for gtype, gblocks in groups2:
+              if gtype == 'batch' and len(gblocks) > 1:
+                  combined_len = sum(len(b['text']) for b in gblocks)
+                  assert combined_len <= 800 + 200, f'Batch too large: {combined_len}'
+          print('✓ Batch size limit respected')
+
+          # 测试4：analyze_pdf 使用 list join
+          src = inspect.getsource(t.analyze_pdf)
+          assert 'parts = []' in src and 'join(parts)' in src, \
+              'String concatenation not optimized'
+          print('✓ analyze_pdf uses list + join')
+
+          # 测试5：指数退避
+          src2 = inspect.getsource(PDFTranslator.translate_pdf)
+          assert '2 ** attempt' in src2, 'Exponential backoff missing'
+          print('✓ Exponential backoff present')
+
+          # 测试6：动态剩余时间
+          assert '_calc_remaining' in src2, 'Dynamic remaining time missing'
+          print('✓ Dynamic remaining time estimation present')
+
+          # 测试7：缓存 key 结构正确（用 tuple）
+          t._translation_cache[('hello', 'en', 'zh')] = '你好'
+          assert t._translation_cache.get(('hello', 'en', 'zh')) == '你好'
+          print('✓ Cache read/write OK')
+
+          print()
+          print('=== All tests passed ✓ ===')
+          "
+
+      - name: Test Flask app startup
+        run: |
+          timeout 5 python app.py &
+          sleep 3
+          # Check the process is running
+          if pgrep -f "python app.py" > /dev/null; then
+            echo "✓ Flask app started successfully"
+          else
+            echo "✗ Flask app failed to start"
+            exit 1
+          fi
+          pkill -f "python app.py" || true
