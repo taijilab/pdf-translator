@@ -309,6 +309,14 @@ async function handleFile(file) {
                 body: formData
             });
 
+            if (!response.ok) {
+                const msg = response.status === 413
+                    ? '文件过大（超过200MB），请压缩PDF后再试'
+                    : `分析失败 (${response.status})`;
+                showMessage(msg, 'error');
+                return;
+            }
+
             const data = await response.json();
 
             if (data.error) {
@@ -506,8 +514,19 @@ translateForm.addEventListener('submit', async (e) => {
         });
 
         if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || '翻译失败');
+            let errMsg = '翻译失败';
+            try {
+                const error = await response.json();
+                errMsg = error.error || errMsg;
+            } catch (_) {
+                // 服务器返回非JSON（如413纯文本），直接用状态码提示
+                if (response.status === 413) {
+                    errMsg = '文件过大（超过200MB），请压缩PDF后再试';
+                } else {
+                    errMsg = `服务器错误 (${response.status})`;
+                }
+            }
+            throw new Error(errMsg);
         }
 
         const result = await response.json();
