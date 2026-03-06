@@ -21,6 +21,8 @@ instance/
 *.swp
 *.swo
 *~
+.claude/
+claude_code_env.sh
 
 # OS
 .DS_Store
