@@ -168,14 +168,17 @@ def translate():
 
         except Exception as e:
             error_msg = str(e)
-            print(f'Translation error: {error_msg}')
             import traceback
-            traceback.print_exc()
+            tb_str = traceback.format_exc()
+            print(f'Translation error: {error_msg}')
+            print(tb_str)
 
             if 'Translation cancelled by user' in error_msg:
                 progress_queue.put({'status': 'cancelled', 'message': '翻译已取消'})
             else:
+                # 把完整堆栈发给前端，方便定位错误行
                 log_callback(f'翻译失败: {error_msg}', 'error')
+                log_callback(f'详细错误信息:\n{tb_str}', 'error')
                 progress_queue.put({'status': 'error', 'error': error_msg})
         finally:
             # 清理文件
@@ -285,14 +288,16 @@ def translate_text():
 
         except Exception as e:
             error_msg = str(e)
-            print(f'Text translation error: {error_msg}')
             import traceback
-            traceback.print_exc()
+            tb_str = traceback.format_exc()
+            print(f'Text translation error: {error_msg}')
+            print(tb_str)
 
             if 'Translation cancelled by user' in error_msg:
                 progress_queue.put({'status': 'cancelled', 'message': '翻译已取消'})
             else:
                 log_callback(f'翻译失败: {error_msg}', 'error')
+                log_callback(f'详细错误信息:\n{tb_str}', 'error')
                 progress_queue.put({'status': 'error', 'error': error_msg})
         finally:
             # 清理文件
