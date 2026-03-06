@@ -188,6 +188,76 @@ class PDFTranslator:
 
         return text
 
+    def _protect_formatting(self, text):
+        """保护特殊格式字符，用占位符替换，翻译后再恢复"""
+        if not text:
+            return text, {}
+
+        import re
+        placeholders = {}
+        idx = 0
+
+        # 定义需要保护的特殊格式
+        # 项目符号
+        bullet_patterns = [
+            r'[●◆◾▪◦■□▪•]',  # 各种项目符号
+            r'\uf0b7',  # Wingdings 项目符号
+        ]
+
+        # 网址链接
+        url_pattern = r'(https?://[^\s]+|www\.[^\s]+)'
+
+        # 注册商标等符号
+        trademark_patterns = [
+            r'®',
+            r'©',
+            r'™',
+        ]
+
+        # 处理项目符号
+        def replace_bullets(match):
+            nonlocal idx, placeholders
+            placeholder = f'__BULLET_{idx}__'
+            placeholders[placeholder] = match.group(0)
+            idx += 1
+            return placeholder
+
+        for pattern in bullet_patterns:
+            text = re.sub(pattern, replace_bullets, text)
+
+        # 处理网址
+        def replace_urls(match):
+            nonlocal idx, placeholders
+            placeholder = f'__URL_{idx}__'
+            placeholders[placeholder] = match.group(0)
+            idx += 1
+            return placeholder
+
+        text = re.sub(url_pattern, replace_urls, text)
+
+        # 处理商标等符号
+        def replace_trademarks(match):
+            nonlocal idx, placeholders
+            placeholder = f'__SYM_{idx}__'
+            placeholders[placeholder] = match.group(0)
+            idx += 1
+            return placeholder
+
+        for pattern in trademark_patterns:
+            text = re.sub(pattern, replace_trademarks, text)
+
+        return text, placeholders
+
+    def _restore_formatting(self, text, placeholders):
+        """恢复被保护的特殊格式字符"""
+        if not placeholders:
+            return text
+
+        for placeholder, original in placeholders.items():
+            text = text.replace(placeholder, original)
+
+        return text
+
     def _estimate_tokens(self, text):
         """估算文本的token数量（粗略估计：中文约1字符=1token，英文约4字符=1token）"""
         if not text:
@@ -264,6 +334,9 @@ class PDFTranslator:
         # deep-translator 使用 'auto' 作为源语言
         normalized_source = 'auto'
 
+        # 保护特殊格式字符（项目符号、链接等）
+        protected_text, placeholders = self._protect_formatting(text)
+
         # 记录输入token（确保总是执行）
         input_tokens = self._estimate_tokens(text)
         self.input_tokens += input_tokens
@@ -273,9 +346,12 @@ class PDFTranslator:
             self._add_log(f'开始翻译，文本长度: {len(text)} 字符, 输入tokens: {input_tokens}', 'info')
 
         max_length = 4000
-        if len(text) <= max_length:
+        if len(protected_text) <= max_length:
             try:
-                translated = GoogleTranslator(source=normalized_source, target=normalized_target).translate(text)
+                translated = GoogleTranslator(source=normalized_source, target=normalized_target).translate(protected_text)
+
+                # 恢复被保护的格式字符
+                translated = self._restore_formatting(translated, placeholders)
 
                 # 记录输出token
                 output_tokens = self._estimate_tokens(translated)
@@ -290,7 +366,7 @@ class PDFTranslator:
         # 分段翻译
         segments = []
         current_segment = ''
-        sentences = text.split('. ')
+        sentences = protected_text.split('. ')
 
         for sentence in sentences:
             if len(current_segment) + len(sentence) < max_length:
@@ -308,6 +384,8 @@ class PDFTranslator:
             try:
                 self._add_log(f'翻译段落 {i+1}/{len(segments)}', 'info')
                 translated = GoogleTranslator(source=normalized_source, target=normalized_target).translate(segment)
+                # 恢复被保护的格式字符
+                translated = self._restore_formatting(translated, placeholders)
                 translated_segments.append(translated)
 
                 # 记录输出token
@@ -317,7 +395,9 @@ class PDFTranslator:
             except Exception as e:
                 print(f'Translation error in segment: {e}')
                 self._add_log(f'段落翻译错误: {str(e)}', 'error')
-                translated_segments.append(segment)
+                # 恢复后添加原文
+                restored_segment = self._restore_formatting(segment, placeholders)
+                translated_segments.append(restored_segment)
 
         return '. '.join(translated_segments)
 
@@ -878,31 +958,66 @@ class PDFTranslator:
             self._add_log(f'📖 开始提取和翻译（并发数: {concurrency}）...', 'info')
             self._add_log(f'⚡ 使用 {concurrency} 个线程并发翻译', 'success')
 
-            # 存储每页的翻译结果: {page_num: [(rect, translated_text), ...]}
+            # 存储每页的翻译结果: {page_num: [(rect, translated_text, font_info), ...]}
             page_translations_map = {}
 
-            # 收集所有需要翻译的文本块
+            # 收集所有需要翻译的文本块，并保存字体信息
+            # 使用 span 级别提取以保留项目符号等特殊格式
             all_blocks = []
             for page_num in range(total_pages):
                 try:
                     page = doc[page_num]
-                    blocks = page.get_text("blocks")
-                    blocks.sort(key=lambda b: (b[1], b[0]))
+                    # 使用 dict 模式获取详细的字体信息
+                    text_dict = page.get_text("dict")
 
-                    for block_idx, block in enumerate(blocks):
-                        if block[6] == 0:  # 文本块
-                            text = block[4]
-                            if text and text.strip() and self._is_translatable(text):
-                                try:
-                                    rect = fitz.Rect(block[0], block[1], block[2], block[3])
-                                    all_blocks.append({
-                                        'page_num': page_num,
-                                        'block_idx': block_idx,
-                                        'text': text,
-                                        'rect': rect
-                                    })
-                                except Exception as rect_err:
-                                    print(f'[WARN] 第{page_num+1}页块{block_idx}坐标异常: {rect_err}')
+                    block_idx = 0
+                    for block in text_dict['blocks']:
+                        if block['type'] != 0:
+                            continue
+
+                        # 按 span 分组提取文本和格式信息
+                        spans_data = []
+                        block_text = ""
+                        for line in block['lines']:
+                            for span in line['spans']:
+                                text = span['text']
+                                block_text += text
+                                spans_data.append({
+                                    'text': text,
+                                    'font': span['font'],
+                                    'size': span['size'],
+                                    'flags': span['flags'],
+                                    'color': span['color']
+                                })
+
+                        if not block_text or not block_text.strip() or not self._is_translatable(block_text):
+                            continue
+
+                        try:
+                            rect = fitz.Rect(block['bbox'])
+                        except Exception as rect_err:
+                            print(f'[WARN] 第{page_num+1}页块{block_idx}坐标异常: {rect_err}')
+                            continue
+
+                        # 获取该块的主要字体信息（取第一个 span 的字体作为代表）
+                        first_span = spans_data[0] if spans_data else None
+
+                        font_info = {
+                            'font': first_span['font'] if first_span else 'helv',
+                            'size': first_span['size'] if first_span else 11,
+                            'flags': first_span['flags'] if first_span else 0,
+                            'color': first_span['color'] if first_span else 0,
+                            'spans': spans_data
+                        }
+
+                        all_blocks.append({
+                            'page_num': page_num,
+                            'block_idx': block_idx,
+                            'text': block_text,
+                            'rect': rect,
+                            'font_info': font_info
+                        })
+                        block_idx += 1
                 except Exception as page_err:
                     self._add_log(f'第{page_num+1}页文本提取失败（已跳过）: {page_err}', 'error')
                     continue
@@ -1142,10 +1257,12 @@ class PDFTranslator:
 
                 for block_info in page_blocks:
                     block_idx = block_info['block_idx']
+                    font_info = block_info.get('font_info', {})
                     result = results.get((page_num, block_idx))
                     if result:
                         rect, translated_text = result
-                        page_translations.append((rect, translated_text))
+                        # 保存字体信息
+                        page_translations.append((rect, translated_text, font_info))
 
                         # 只显示前3页和后3页的译文
                         if page_num < 3 or page_num >= total_pages - 3:
@@ -1183,21 +1300,16 @@ class PDFTranslator:
                     page = doc[page_num]
                     page_translations = page_translations_map.get(page_num, [])
 
-                    # 获取原页面的尺寸和旋转（某些日文PDF页面结构异常会在此抛出）
+                    # 某些 PDF 在取尺寸或旋转时会抛出异常，直接跳过该页。
                     mediabox = page.mediabox
                     rotation = page.rotation
-
-                    # 创建新页面
                     new_page = new_doc.new_page(
                         width=mediabox.width,
                         height=mediabox.height
                     )
 
-                    # 设置页面旋转（只允许 0/90/180/270）
                     if rotation and rotation in (90, 180, 270):
                         new_page.set_rotation(rotation)
-
-                    # 填充白色背景
                     new_page.draw_rect(new_page.rect, color=(1, 1, 1), fill=(1, 1, 1))
                 except Exception as page_setup_err:
                     self._add_log(f'第{page_num+1}页初始化失败（已跳过）: {page_setup_err}', 'error')
@@ -1229,14 +1341,61 @@ class PDFTranslator:
                 success_count = 0
                 page_bottom = new_page.rect.height - 5
 
-                for idx, (text_rect, translated_text) in enumerate(page_translations):
+                for idx, (text_rect, translated_text, font_info) in enumerate(page_translations):
                     try:
                         written = False
-                        font_names = ["china-s", "china-t", "helv"]
+
+                        # 获取原始字体信息
+                        original_font = font_info.get('font', 'helv')
+                        original_size = font_info.get('size', 11)
+                        original_flags = font_info.get('flags', 0)
+
+                        # 判断是否为粗体
+                        is_bold = (original_flags & 16) != 0
+                        is_italic = (original_flags & 1) != 0
+
+                        # 检测翻译后文本的主要语言
+                        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', translated_text))
+                        total_chars = len(translated_text)
+                        is_chinese = chinese_chars > total_chars * 0.3 if total_chars > 0 else False
+
+                        # 根据翻译后文本语言选择字体
+                        if is_chinese:
+                            # 中文翻译：使用中文字体
+                            if is_bold:
+                                font_names = ['china-s', 'china-ss', 'china-t']
+                            else:
+                                font_names = ['china-s', 'china-t', 'china-ss']
+                        else:
+                            # 英文或其他语言：保留原始字体或使用通用英文字体
+                            # PyMuPDF 支持的内置字体
+                            if original_font and 'Times' in original_font:
+                                font_names = ['times-roman', 'times-italic', 'times-bold', 'helv']
+                            elif original_font and 'Helv' in original_font:
+                                font_names = ['helv', 'helv-bold', 'times-roman']
+                            elif original_font and 'Courier' in original_font:
+                                font_names = ['courier', 'courier-bold', 'helv']
+                            else:
+                                # 通用英文字体，根据粗体/斜体选择
+                                if is_bold and is_italic:
+                                    font_names = ['helv-bolditalic', 'helv-bold', 'helv']
+                                elif is_bold:
+                                    font_names = ['helv-bold', 'helv', 'times-bold']
+                                elif is_italic:
+                                    font_names = ['helv-italic', 'helv', 'times-italic']
+                                else:
+                                    font_names = ['helv', 'times-roman', 'courier']
+
+                        # 使用原始字体大小（中文适当缩小）
+                        if is_chinese:
+                            base_fontsize = max(6, original_size * 0.85)
+                        else:
+                            base_fontsize = max(6, original_size * 0.95)
+                        font_sizes = [base_fontsize, base_fontsize * 0.85, base_fontsize * 0.7, 6]
 
                         for font_name in font_names:
                             # 逐步缩小字体尝试放入原矩形
-                            for fontsize in [11, 9, 7, 6]:
+                            for fontsize in font_sizes:
                                 try:
                                     result = new_page.insert_textbox(
                                         text_rect,
@@ -1417,7 +1576,7 @@ class PDFTranslator:
         full_text = '\n\n'.join([block['text'] for block in all_text_blocks])
         self._add_log(f'合并后总字符数: {len(full_text)}', 'info')
 
-        # 将文本分割成块进行翻译（每块约8000字符：减少API调用次数，提升速度）
+        # 较大的文本块可减少 API 调用次数，文本版输出对版式约束也更低。
         chunk_size = 8000
         text_chunks = []
         for i in range(0, len(full_text), chunk_size):
