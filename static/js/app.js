@@ -519,6 +519,7 @@ translateForm.addEventListener('submit', async (e) => {
                 const error = await response.json();
                 errMsg = error.error || errMsg;
             } catch (_) {
+                // 服务器返回非JSON（如413纯文本），直接用状态码提示
                 if (response.status === 413) {
                     errMsg = '文件过大（超过200MB），请压缩PDF后再试';
                 } else {

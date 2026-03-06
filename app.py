@@ -14,7 +14,6 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB max file size
 app.config['UPLOAD_FOLDER'] = tempfile.gettempdir()
 app.config['ALLOWED_EXTENSIONS'] = {'pdf'}
-
 @app.errorhandler(413)
 def request_entity_too_large(e):
     return jsonify({'error': '文件过大（超过200MB），请压缩PDF后再试'}), 413
@@ -218,6 +217,7 @@ def translate():
             if 'Translation cancelled by user' in error_msg:
                 progress_queue.put({'status': 'cancelled', 'message': '翻译已取消'})
             else:
+                # 把完整堆栈发给前端，方便定位错误行
                 log_callback(f'翻译失败: {error_msg}', 'error')
                 log_callback(f'详细错误信息:\n{tb_str}', 'error')
                 progress_queue.put({'status': 'error', 'error': error_msg})

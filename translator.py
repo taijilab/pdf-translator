@@ -57,10 +57,11 @@ class PDFTranslator:
         pass
 
     def _is_translatable(self, text):
-        """跳过纯数字、符号和极短块，减少无意义调用。"""
+        """判断文本块是否需要翻译；跳过纯数字/符号/极短文本，节省 API 调用"""
         stripped = text.strip()
         if len(stripped) <= 1:
             return False
+        # 纯数字、标点、空白、数学符号、特殊字符组成的块跳过
         if re.match(r'^[\d\s\.,\-\+\(\)\[\]\{\}\/\\\|：；。、！？，""''「」【】・…—–×÷=<>%°#@&*^~`\'\"]+$', stripped):
             return False
         return True
@@ -1029,6 +1030,7 @@ class PDFTranslator:
             self._add_log('开始翻译...', 'info')
 
             # 将短文本块合并成批次，减少 API 调用次数
+            # max_group_chars=4000：LLM 单次可处理更多文本；short_threshold=500：更多块参与合并
             groups = self._group_short_blocks(all_blocks, max_group_chars=4000, short_threshold=500)
             batch_count = sum(1 for t, _ in groups if t == 'batch' and len(_) > 1)
             single_count = len(groups) - batch_count
@@ -1301,7 +1303,6 @@ class PDFTranslator:
                     # 某些 PDF 在取尺寸或旋转时会抛出异常，直接跳过该页。
                     mediabox = page.mediabox
                     rotation = page.rotation
-
                     new_page = new_doc.new_page(
                         width=mediabox.width,
                         height=mediabox.height
@@ -1309,7 +1310,6 @@ class PDFTranslator:
 
                     if rotation and rotation in (90, 180, 270):
                         new_page.set_rotation(rotation)
-
                     new_page.draw_rect(new_page.rect, color=(1, 1, 1), fill=(1, 1, 1))
                 except Exception as page_setup_err:
                     self._add_log(f'第{page_num+1}页初始化失败（已跳过）: {page_setup_err}', 'error')
