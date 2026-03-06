@@ -6,11 +6,18 @@ import tempfile
 import queue
 import threading
 import json
+import re
+import time
+import uuid
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB max file size
 app.config['UPLOAD_FOLDER'] = tempfile.gettempdir()
 app.config['ALLOWED_EXTENSIONS'] = {'pdf'}
+
+@app.errorhandler(413)
+def request_entity_too_large(e):
+    return jsonify({'error': '文件过大（超过200MB），请压缩PDF后再试'}), 413
 
 # 存储进度信息
 progress_queues = {}
@@ -18,9 +25,26 @@ progress_queues = {}
 # 存储取消标志
 cancel_flags = {}
 
+# 存储任务工作区和输出文件信息
+task_registry = {}
+
+task_registry_lock = threading.Lock()
+
 # 允许的文件扩展名
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+def normalize_task_id(raw_task_id):
+    """规范化任务ID，防止注入和路径穿透。"""
+    if not raw_task_id:
+        return f"task_{uuid.uuid4().hex}"
+    if re.fullmatch(r'[A-Za-z0-9_-]{1,64}', raw_task_id):
+        return raw_task_id
+    return f"task_{uuid.uuid4().hex}"
+
+def create_task_workspace(task_id):
+    """为任务创建独立临时目录。"""
+    return tempfile.mkdtemp(prefix=f"pdf_task_{task_id}_", dir=app.config['UPLOAD_FOLDER'])
 
 @app.route('/')
 def index():
@@ -42,9 +66,14 @@ def analyze():
     if not allowed_file(file.filename):
         return jsonify({'error': '只支持PDF文件'}), 400
 
-    # 保存临时文件
-    filename = secure_filename(file.filename)
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], f'temp_{filename}')
+    temp_file = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".pdf",
+        prefix="analyze_",
+        dir=app.config['UPLOAD_FOLDER']
+    )
+    filepath = temp_file.name
+    temp_file.close()
     file.save(filepath)
 
     try:
@@ -101,23 +130,35 @@ def translate():
     api_key = request.form.get('api_key', '')
     source_lang = request.form.get('source_lang', 'auto')
     target_lang = request.form.get('target_lang', 'en')
-    task_id = request.form.get('task_id', '')
+    task_id = normalize_task_id(request.form.get('task_id', ''))
     concurrency = int(request.form.get('concurrency', 4))  # 获取并发数，默认4
 
     # 调试：打印并发参数
     print(f"[DEBUG] Received concurrency parameter: {concurrency}")
 
-    # 保存上传的文件
+    # 保存上传的文件到任务专属目录
     filename = secure_filename(file.filename)
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    base_name, _ = os.path.splitext(filename)
+    if not base_name:
+        base_name = "document"
+
+    task_dir = create_task_workspace(task_id)
+    filepath = os.path.join(task_dir, f"input_{filename}")
+    output_filename = f"translated_{base_name}.pdf"
+    output_filepath = os.path.join(task_dir, output_filename)
+
     file.save(filepath)
 
     # 创建进度队列
     progress_queue = queue.Queue()
-    progress_queues[task_id] = progress_queue
-
-    # 初始化取消标志
-    cancel_flags[task_id] = False
+    with task_registry_lock:
+        progress_queues[task_id] = progress_queue
+        cancel_flags[task_id] = False
+        task_registry[task_id] = {
+            'task_dir': task_dir,
+            'output_file': output_filename,
+            'created_at': time.time()
+        }
 
     # 进度回调函数
     def progress_callback(progress_data):
@@ -153,9 +194,6 @@ def translate():
             # 发送初始化日志
             log_callback('正在初始化翻译器...', 'info')
 
-            output_filename = f'translated_{filename}'
-            output_filepath = os.path.join(app.config['UPLOAD_FOLDER'], output_filename)
-
             translator.translate_pdf(
                 filepath,
                 output_filepath,
@@ -164,18 +202,24 @@ def translate():
                 concurrency=concurrency
             )
 
-            progress_queue.put({'status': 'completed', 'output_file': output_filename})
+            progress_queue.put({
+                'status': 'completed',
+                'task_id': task_id,
+                'output_file': output_filename
+            })
 
         except Exception as e:
             error_msg = str(e)
-            print(f'Translation error: {error_msg}')
             import traceback
-            traceback.print_exc()
+            tb_str = traceback.format_exc()
+            print(f'Translation error: {error_msg}')
+            print(tb_str)
 
             if 'Translation cancelled by user' in error_msg:
                 progress_queue.put({'status': 'cancelled', 'message': '翻译已取消'})
             else:
                 log_callback(f'翻译失败: {error_msg}', 'error')
+                log_callback(f'详细错误信息:\n{tb_str}', 'error')
                 progress_queue.put({'status': 'error', 'error': error_msg})
         finally:
             # 清理文件
@@ -185,8 +229,9 @@ def translate():
             except:
                 pass
             # 清理取消标志
-            if task_id in cancel_flags:
-                del cancel_flags[task_id]
+            with task_registry_lock:
+                if task_id in cancel_flags:
+                    del cancel_flags[task_id]
 
     thread = threading.Thread(target=translate_in_background)
     thread.start()
@@ -214,20 +259,32 @@ def translate_text():
     api_key = request.form.get('api_key', '')
     source_lang = request.form.get('source_lang', 'auto')
     target_lang = request.form.get('target_lang', 'zh')
-    task_id = request.form.get('task_id', '')
+    task_id = normalize_task_id(request.form.get('task_id', ''))
     concurrency = int(request.form.get('concurrency', 4))
 
-    # 保存上传的文件
+    # 保存上传的文件到任务专属目录
     filename = secure_filename(file.filename)
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    base_name, _ = os.path.splitext(filename)
+    if not base_name:
+        base_name = "document"
+
+    task_dir = create_task_workspace(task_id)
+    filepath = os.path.join(task_dir, f"input_{filename}")
+    output_filename = f"translated_{base_name}.txt"
+    output_filepath = os.path.join(task_dir, output_filename)
+
     file.save(filepath)
 
     # 创建进度队列
     progress_queue = queue.Queue()
-    progress_queues[task_id] = progress_queue
-
-    # 初始化取消标志
-    cancel_flags[task_id] = False
+    with task_registry_lock:
+        progress_queues[task_id] = progress_queue
+        cancel_flags[task_id] = False
+        task_registry[task_id] = {
+            'task_dir': task_dir,
+            'output_file': output_filename,
+            'created_at': time.time()
+        }
 
     # 进度回调函数
     def progress_callback(progress_data):
@@ -262,11 +319,6 @@ def translate_text():
             # 发送初始化日志
             log_callback('正在提取PDF文本...', 'info')
 
-            # 生成输出文件名
-            base_name = filename.rsplit('.', 1)[0]
-            output_filename = f'translated_{base_name}.txt'
-            output_filepath = os.path.join(app.config['UPLOAD_FOLDER'], output_filename)
-
             # 执行文本翻译
             translator.translate_pdf_to_text(
                 filepath,
@@ -278,6 +330,7 @@ def translate_text():
 
             progress_queue.put({
                 'status': 'completed',
+                'task_id': task_id,
                 'output_file': output_filename,
                 'input_tokens': translator.input_tokens,
                 'output_tokens': translator.output_tokens
@@ -285,14 +338,16 @@ def translate_text():
 
         except Exception as e:
             error_msg = str(e)
-            print(f'Text translation error: {error_msg}')
             import traceback
-            traceback.print_exc()
+            tb_str = traceback.format_exc()
+            print(f'Text translation error: {error_msg}')
+            print(tb_str)
 
             if 'Translation cancelled by user' in error_msg:
                 progress_queue.put({'status': 'cancelled', 'message': '翻译已取消'})
             else:
                 log_callback(f'翻译失败: {error_msg}', 'error')
+                log_callback(f'详细错误信息:\n{tb_str}', 'error')
                 progress_queue.put({'status': 'error', 'error': error_msg})
         finally:
             # 清理文件
@@ -302,8 +357,9 @@ def translate_text():
             except:
                 pass
             # 清理取消标志
-            if task_id in cancel_flags:
-                del cancel_flags[task_id]
+            with task_registry_lock:
+                if task_id in cancel_flags:
+                    del cancel_flags[task_id]
 
     thread = threading.Thread(target=translate_text_in_background)
     thread.start()
@@ -313,17 +369,18 @@ def translate_text():
 @app.route('/cancel/<task_id>', methods=['POST'])
 def cancel_translation(task_id):
     """取消翻译任务"""
-    if task_id in cancel_flags:
-        cancel_flags[task_id] = True
-        return jsonify({'status': 'cancelling', 'message': '正在取消翻译...'})
-    else:
-        return jsonify({'error': 'Task not found'}), 404
+    with task_registry_lock:
+        if task_id in cancel_flags:
+            cancel_flags[task_id] = True
+            return jsonify({'status': 'cancelling', 'message': '正在取消翻译...'})
+    return jsonify({'error': 'Task not found'}), 404
 
 @app.route('/progress/<task_id>')
 def progress(task_id):
     """Server-Sent Events端点，用于实时推送进度"""
     def generate():
-        queue_obj = progress_queues.get(task_id)
+        with task_registry_lock:
+            queue_obj = progress_queues.get(task_id)
         if not queue_obj:
             error_data = {'error': 'Invalid task ID'}
             yield f"data: {json.dumps(error_data)}\n\n"
@@ -364,15 +421,27 @@ def progress(task_id):
             yield f"data: {json.dumps(error_data)}\n\n"
         finally:
             # 清理队列
-            if task_id in progress_queues:
-                del progress_queues[task_id]
+            with task_registry_lock:
+                if task_id in progress_queues:
+                    del progress_queues[task_id]
 
     return Response(generate(), mimetype='text/event-stream')
 
-@app.route('/download/<filename>')
-def download(filename):
+@app.route('/download/<task_id>/<filename>')
+def download(task_id, filename):
     """下载翻译后的文件"""
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    with task_registry_lock:
+        task_meta = task_registry.get(task_id)
+
+    if not task_meta:
+        return jsonify({'error': 'Task not found'}), 404
+
+    if filename != task_meta.get('output_file'):
+        return jsonify({'error': 'File not found for task'}), 404
+
+    filepath = os.path.join(task_meta['task_dir'], filename)
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'File not ready'}), 404
 
     # 不删除文件，允许多次下载
     # 文件会在系统临时目录中自动清理，或用户可以手动清理
@@ -391,6 +460,7 @@ def download(filename):
     )
 
 if __name__ == '__main__':
-    # 禁用debug模式以避免后台线程丢失
-    # 使用use_reloader=False确保文件改动不会导致进程重启
-    app.run(debug=True, use_reloader=False, host='0.0.0.0', port=5001)
+    # 本地运行：python app.py
+    # 生产部署：gunicorn --workers 1 --threads 8 --timeout 0 app:app
+    # 注意：必须单进程，progress_queues/cancel_flags 存于内存，多进程会丢失 SSE 进度流
+    app.run(debug=False, use_reloader=False, host='0.0.0.0', port=5001, threaded=True)

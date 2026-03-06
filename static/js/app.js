@@ -309,6 +309,14 @@ async function handleFile(file) {
                 body: formData
             });
 
+            if (!response.ok) {
+                const msg = response.status === 413
+                    ? '文件过大（超过200MB），请压缩PDF后再试'
+                    : `分析失败 (${response.status})`;
+                showMessage(msg, 'error');
+                return;
+            }
+
             const data = await response.json();
 
             if (data.error) {
@@ -506,8 +514,18 @@ translateForm.addEventListener('submit', async (e) => {
         });
 
         if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || '翻译失败');
+            let errMsg = '翻译失败';
+            try {
+                const error = await response.json();
+                errMsg = error.error || errMsg;
+            } catch (_) {
+                if (response.status === 413) {
+                    errMsg = '文件过大（超过200MB），请压缩PDF后再试';
+                } else {
+                    errMsg = `服务器错误 (${response.status})`;
+                }
+            }
+            throw new Error(errMsg);
         }
 
         const result = await response.json();
@@ -597,8 +615,10 @@ function connectToProgressStream(taskId, filename) {
                     estimated_cost: data.estimated_cost || 0
                 });
 
+                const completedTaskId = currentTaskId || data.task_id;
+
                 // 显示预览和下载按钮
-                showCompletionActions(data.output_file);
+                showCompletionActions(completedTaskId, data.output_file);
 
                 showMessage('翻译完成！请预览或下载文件', 'success');
                 eventSource.close();
@@ -693,9 +713,9 @@ function connectToProgressStream(taskId, filename) {
 }
 
 // 下载文件
-async function downloadFile(filename) {
+async function downloadFile(taskId, filename) {
     try {
-        const response = await fetch(`/download/${filename}`);
+        const response = await fetch(`/download/${taskId}/${filename}`);
         if (!response.ok) throw new Error('下载失败');
 
         const blob = await response.blob();
@@ -771,12 +791,19 @@ function clearComparisonView() {
 }
 
 // 显示完成后的操作按钮
-function showCompletionActions(outputFile) {
+function showCompletionActions(taskId, outputFile) {
     const completionActions = document.getElementById('completionActions');
     const downloadBtn = document.getElementById('downloadBtn');
     const previewBtn = document.getElementById('previewBtn');
 
+    if (!taskId) {
+        addLog('缺少任务ID，无法下载结果文件', 'error');
+        return;
+    }
+
     // 保存文件名
+    downloadBtn.dataset.taskId = taskId;
+    previewBtn.dataset.taskId = taskId;
     downloadBtn.dataset.filename = outputFile;
     previewBtn.dataset.filename = outputFile;
 
@@ -785,30 +812,30 @@ function showCompletionActions(outputFile) {
 
     // 绑定下载按钮事件
     downloadBtn.onclick = () => {
-        downloadFile(outputFile);
+        downloadFile(taskId, outputFile);
     };
 
     // 绑定预览按钮事件
     previewBtn.onclick = () => {
-        previewFile(outputFile);
+        previewFile(taskId, outputFile);
     };
 }
 
 // 预览文件
-async function previewFile(filename) {
+async function previewFile(taskId, filename) {
     // 检查是否是TXT文件
     if (filename.endsWith('.txt')) {
         // 使用模态框预览文本
-        showTextPreview(filename);
+        showTextPreview(taskId, filename);
     } else {
         // PDF文件在新窗口打开
-        const previewUrl = `/download/${filename}`;
+        const previewUrl = `/download/${taskId}/${filename}`;
         window.open(previewUrl, '_blank');
     }
 }
 
 // 显示文本预览模态框
-async function showTextPreview(filename) {
+async function showTextPreview(taskId, filename) {
     const modal = document.getElementById('previewModal');
     const previewText = document.getElementById('previewText');
     const previewInfo = document.getElementById('previewInfo');
@@ -820,7 +847,7 @@ async function showTextPreview(filename) {
     previewText.textContent = '加载中...';
 
     try {
-        const response = await fetch(`/download/${filename}`);
+        const response = await fetch(`/download/${taskId}/${filename}`);
         if (!response.ok) throw new Error('加载失败');
 
         const text = await response.text();
