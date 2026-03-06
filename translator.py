@@ -1179,25 +1179,29 @@ class PDFTranslator:
             for page_num in range(total_pages):
                 self._check_cancelled()
 
-                page = doc[page_num]
-                page_translations = page_translations_map.get(page_num, [])
+                try:
+                    page = doc[page_num]
+                    page_translations = page_translations_map.get(page_num, [])
 
-                # 获取原页面的尺寸和旋转
-                mediabox = page.mediabox
-                rotation = page.rotation
+                    # 获取原页面的尺寸和旋转（某些日文PDF页面结构异常会在此抛出）
+                    mediabox = page.mediabox
+                    rotation = page.rotation
 
-                # 创建新页面
-                new_page = new_doc.new_page(
-                    width=mediabox.width,
-                    height=mediabox.height
-                )
+                    # 创建新页面
+                    new_page = new_doc.new_page(
+                        width=mediabox.width,
+                        height=mediabox.height
+                    )
 
-                # 设置页面旋转
-                if rotation:
-                    new_page.set_rotation(rotation)
+                    # 设置页面旋转（只允许 0/90/180/270）
+                    if rotation and rotation in (90, 180, 270):
+                        new_page.set_rotation(rotation)
 
-                # 填充白色背景
-                new_page.draw_rect(new_page.rect, color=(1, 1, 1), fill=(1, 1, 1))
+                    # 填充白色背景
+                    new_page.draw_rect(new_page.rect, color=(1, 1, 1), fill=(1, 1, 1))
+                except Exception as page_setup_err:
+                    self._add_log(f'第{page_num+1}页初始化失败（已跳过）: {page_setup_err}', 'error')
+                    continue
 
                 # 复制原页面的所有图片
                 try:
