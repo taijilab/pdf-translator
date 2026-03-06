@@ -391,6 +391,7 @@ def download(filename):
     )
 
 if __name__ == '__main__':
-    # 禁用debug模式以避免后台线程丢失
-    # 使用use_reloader=False确保文件改动不会导致进程重启
-    app.run(debug=True, use_reloader=False, host='0.0.0.0', port=5001)
+    # 本地运行：python app.py
+    # 生产部署：gunicorn --workers 1 --threads 8 --timeout 0 app:app
+    # 注意：必须单进程，progress_queues/cancel_flags 存于内存，多进程会丢失 SSE 进度流
+    app.run(debug=False, use_reloader=False, host='0.0.0.0', port=5001, threaded=True)
