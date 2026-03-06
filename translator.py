@@ -45,6 +45,7 @@ class PDFTranslator:
         self.output_tokens = 0
         self.translator = None  # 初始化为None
         self._translation_cache = {}  # 翻译缓存：(text, src, tgt) -> translated
+        self._session = requests.Session()  # 复用 HTTP 连接，减少握手开销
 
         # 只在需要时初始化translator
         if self.api_type == 'google':
@@ -54,6 +55,16 @@ class PDFTranslator:
         """设置翻译器"""
         # deep-translator 不需要预先设置translator实例
         pass
+
+    def _is_translatable(self, text):
+        """判断文本块是否需要翻译；跳过纯数字/符号/极短文本，节省 API 调用"""
+        stripped = text.strip()
+        if len(stripped) <= 1:
+            return False
+        # 纯数字、标点、空白、数学符号、特殊字符组成的块跳过
+        if re.match(r'^[\d\s\.,\-\+\(\)\[\]\{\}\/\\\|：；。、！？，""''「」【】・…—–×÷=<>%°#@&*^~`\'\"]+$', stripped):
+            return False
+        return True
 
     def _group_short_blocks(self, all_blocks, max_group_chars=800, short_threshold=150):
         """将连续短文本块合并成批次，减少 API 调用次数。
@@ -357,7 +368,7 @@ class PDFTranslator:
                 "temperature": 0.3
             }
 
-            response = requests.post(url, headers=headers, json=data, timeout=60)
+            response = self._session.post(url, headers=headers, json=data, timeout=60)
             result = response.json()
 
             if 'choices' in result and len(result['choices']) > 0:
@@ -428,7 +439,7 @@ class PDFTranslator:
                 "temperature": 0.3
             }
 
-            response = requests.post(url, headers=headers, json=data, timeout=60)
+            response = self._session.post(url, headers=headers, json=data, timeout=60)
             result = response.json()
 
             if 'choices' in result and len(result['choices']) > 0:
@@ -504,7 +515,7 @@ class PDFTranslator:
                 "temperature": 0.3
             }
 
-            response = requests.post(url, headers=headers, json=data, timeout=60)
+            response = self._session.post(url, headers=headers, json=data, timeout=60)
             result = response.json()
 
             if 'choices' in result and len(result['choices']) > 0:
@@ -580,7 +591,7 @@ class PDFTranslator:
                 "temperature": 0.1
             }
 
-            response = requests.post(url, headers=headers, json=data, timeout=120)
+            response = self._session.post(url, headers=headers, json=data, timeout=120)
             result = response.json()
 
             if 'choices' in result and len(result['choices']) > 0:
@@ -655,7 +666,7 @@ class PDFTranslator:
                 "temperature": 0.1
             }
 
-            response = requests.post(url, headers=headers, json=data, timeout=120)
+            response = self._session.post(url, headers=headers, json=data, timeout=120)
             result = response.json()
 
             if 'choices' in result and len(result['choices']) > 0:
@@ -873,20 +884,28 @@ class PDFTranslator:
             # 收集所有需要翻译的文本块
             all_blocks = []
             for page_num in range(total_pages):
-                page = doc[page_num]
-                blocks = page.get_text("blocks")
-                blocks.sort(key=lambda b: (b[1], b[0]))
+                try:
+                    page = doc[page_num]
+                    blocks = page.get_text("blocks")
+                    blocks.sort(key=lambda b: (b[1], b[0]))
 
-                for block_idx, block in enumerate(blocks):
-                    if block[6] == 0:  # 文本块
-                        text = block[4]
-                        if text and text.strip():
-                            all_blocks.append({
-                                'page_num': page_num,
-                                'block_idx': block_idx,
-                                'text': text,
-                                'rect': fitz.Rect(block[0], block[1], block[2], block[3])
-                            })
+                    for block_idx, block in enumerate(blocks):
+                        if block[6] == 0:  # 文本块
+                            text = block[4]
+                            if text and text.strip() and self._is_translatable(text):
+                                try:
+                                    rect = fitz.Rect(block[0], block[1], block[2], block[3])
+                                    all_blocks.append({
+                                        'page_num': page_num,
+                                        'block_idx': block_idx,
+                                        'text': text,
+                                        'rect': rect
+                                    })
+                                except Exception as rect_err:
+                                    print(f'[WARN] 第{page_num+1}页块{block_idx}坐标异常: {rect_err}')
+                except Exception as page_err:
+                    self._add_log(f'第{page_num+1}页文本提取失败（已跳过）: {page_err}', 'error')
+                    continue
 
             total_blocks = len(all_blocks)
             self._add_log(f'总共提取到 {total_blocks} 个文本块', 'info')
@@ -896,7 +915,8 @@ class PDFTranslator:
             self._add_log('开始翻译...', 'info')
 
             # 将短文本块合并成批次，减少 API 调用次数
-            groups = self._group_short_blocks(all_blocks)
+            # max_group_chars=4000：LLM 单次可处理更多文本；short_threshold=500：更多块参与合并
+            groups = self._group_short_blocks(all_blocks, max_group_chars=4000, short_threshold=500)
             batch_count = sum(1 for t, _ in groups if t == 'batch' and len(_) > 1)
             single_count = len(groups) - batch_count
             self._add_log(f'文本块分组完成：{single_count} 个单独翻译，{batch_count} 个批次合并翻译', 'info')
@@ -1208,7 +1228,7 @@ class PDFTranslator:
                 for idx, (text_rect, translated_text) in enumerate(page_translations):
                     try:
                         written = False
-                        font_names = ["china-s", "china-t", "helv", "china-ss"]
+                        font_names = ["china-s", "china-t", "helv"]
 
                         for font_name in font_names:
                             # 逐步缩小字体尝试放入原矩形
@@ -1393,8 +1413,8 @@ class PDFTranslator:
         full_text = '\n\n'.join([block['text'] for block in all_text_blocks])
         self._add_log(f'合并后总字符数: {len(full_text)}', 'info')
 
-        # 将文本分割成块进行翻译（每块约4000字符，平衡速度和质量）
-        chunk_size = 4000
+        # 将文本分割成块进行翻译（每块约8000字符：减少API调用次数，提升速度）
+        chunk_size = 8000
         text_chunks = []
         for i in range(0, len(full_text), chunk_size):
             chunk = full_text[i:i + chunk_size]
