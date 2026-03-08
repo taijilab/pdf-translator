@@ -174,6 +174,7 @@ def load_scoped_glossary(filename=None):
             'scope': 'global',
             'source_label': '全局术语库',
             'file_key': None,
+            'source_path': GLOSSARY_PATH if os.path.exists(GLOSSARY_PATH) else '',
         }
 
     key = build_glossary_key(filename)
@@ -185,6 +186,7 @@ def load_scoped_glossary(filename=None):
             'scope': 'file',
             'source_label': f'文件术语库: {key}',
             'file_key': key,
+            'source_path': file_path,
         }
 
     for preset_path in _preset_glossary_candidates(filename):
@@ -195,6 +197,7 @@ def load_scoped_glossary(filename=None):
                 'scope': 'preset',
                 'source_label': f'预设词表: {os.path.basename(preset_path)}',
                 'file_key': key,
+                'source_path': preset_path,
             }
 
     return {
@@ -202,6 +205,7 @@ def load_scoped_glossary(filename=None):
         'scope': 'global',
         'source_label': '全局术语库',
         'file_key': key,
+        'source_path': GLOSSARY_PATH if os.path.exists(GLOSSARY_PATH) else '',
     }
 
 
@@ -214,6 +218,7 @@ def save_scoped_glossary(terms, filename=None):
             'scope': 'global',
             'source_label': '全局术语库',
             'file_key': None,
+            'source_path': GLOSSARY_PATH,
         }
 
     key = build_glossary_key(filename)
@@ -224,6 +229,7 @@ def save_scoped_glossary(terms, filename=None):
         'scope': 'file',
         'source_label': f'文件术语库: {key}',
         'file_key': key,
+        'source_path': path,
     }
 
 
@@ -742,10 +748,24 @@ def glossary():
             'scope': 'global',
             'source_label': '全局术语库',
             'file_key': None,
+            'source_path': GLOSSARY_PATH,
         }
     else:
         saved = save_scoped_glossary(terms, filename or None)
     return jsonify({'status': 'ok', **saved})
+
+
+@app.route('/glossary/file', methods=['DELETE'])
+def delete_file_glossary():
+    filename = request.args.get('filename', '').strip()
+    if not filename:
+        return jsonify({'error': '缺少文件名'}), 400
+    key = build_glossary_key(filename)
+    path = os.path.join(GLOSSARY_DIR, f'{key}.json')
+    if os.path.exists(path):
+        os.remove(path)
+    glossary_state = load_scoped_glossary(filename)
+    return jsonify({'status': 'ok', **glossary_state, 'deleted_file_key': key})
 
 
 @app.route('/glossary/export')

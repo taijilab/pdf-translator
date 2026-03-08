@@ -29,9 +29,11 @@ const saveGlossaryBtn = document.getElementById('saveGlossaryBtn');
 const importGlossaryBtn = document.getElementById('importGlossaryBtn');
 const importGlossaryInput = document.getElementById('importGlossaryInput');
 const exportGlossaryBtn = document.getElementById('exportGlossaryBtn');
+const deleteGlossaryBtn = document.getElementById('deleteGlossaryBtn');
 const saveGlobalGlossaryBtn = document.getElementById('saveGlobalGlossaryBtn');
 const glossarySourceEl = document.getElementById('glossarySource');
 const glossaryKeyEl = document.getElementById('glossaryKey');
+const glossaryPathEl = document.getElementById('glossaryPath');
 const versionBadge = document.getElementById('versionBadge');
 const buildBadge = document.getElementById('buildBadge');
 let currentTaskId = null;
@@ -63,6 +65,12 @@ function setGlossarySource(label) {
 function setGlossaryKey(fileKey) {
     if (glossaryKeyEl) {
         glossaryKeyEl.textContent = `文件Key：${fileKey || '未选择文件'}`;
+    }
+}
+
+function setGlossaryPath(path) {
+    if (glossaryPathEl) {
+        glossaryPathEl.textContent = `来源文件：${path || '-'}`;
     }
 }
 
@@ -111,6 +119,7 @@ async function loadGlossary(filename = '') {
         setGlossaryTerms(data.terms || []);
         setGlossarySource(data.source_label);
         setGlossaryKey(data.file_key);
+        setGlossaryPath(data.source_path);
     } catch (error) {
         console.error('Failed to load glossary:', error);
     }
@@ -155,6 +164,7 @@ async function saveGlossaryWithScope(saveScope = 'file') {
         setGlossaryTerms(data.terms || []);
         setGlossarySource(data.source_label);
         setGlossaryKey(data.file_key);
+        setGlossaryPath(data.source_path);
         showMessage(saveScope === 'global' ? '已另存为全局术语库' : '术语库已保存', 'success');
     } catch (error) {
         showMessage(error.message || '保存术语库失败', 'error');
@@ -183,6 +193,29 @@ async function exportGlossary() {
         showMessage('术语库已导出', 'success');
     } catch (error) {
         showMessage(error.message || '导出术语库失败', 'error');
+    }
+}
+
+async function deleteFileGlossary() {
+    if (!currentGlossaryFilename) {
+        showMessage('请先选择文件', 'error');
+        return;
+    }
+    try {
+        const response = await fetch(`/glossary/file?filename=${encodeURIComponent(currentGlossaryFilename)}`, {
+            method: 'DELETE'
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || '删除文件术语库失败');
+        }
+        setGlossaryTerms(data.terms || []);
+        setGlossarySource(data.source_label);
+        setGlossaryKey(data.file_key);
+        setGlossaryPath(data.source_path);
+        showMessage(`已删除文件术语库：${data.deleted_file_key}`, 'success');
+    } catch (error) {
+        showMessage(error.message || '删除文件术语库失败', 'error');
     }
 }
 
@@ -269,6 +302,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (exportGlossaryBtn) {
         exportGlossaryBtn.addEventListener('click', exportGlossary);
+    }
+    if (deleteGlossaryBtn) {
+        deleteGlossaryBtn.addEventListener('click', deleteFileGlossary);
     }
     if (importGlossaryBtn && importGlossaryInput) {
         importGlossaryBtn.addEventListener('click', () => importGlossaryInput.click());

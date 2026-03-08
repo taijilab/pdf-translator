@@ -90,6 +90,13 @@ header h1 {
     font-size: 12px;
 }
 
+.glossary-path {
+    margin-bottom: 10px;
+    color: #8a93a8;
+    font-size: 12px;
+    word-break: break-all;
+}
+
 /* 输出格式选择 */
 .output-format-section {
     margin-bottom: 20px;
