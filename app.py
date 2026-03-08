@@ -37,6 +37,8 @@ def _read_git_value(args, fallback):
 
 
 GLOSSARY_PATH = os.path.join(BASE_DIR, 'glossary.json')
+GLOSSARY_DIR = os.path.join(BASE_DIR, 'glossaries')
+PRESET_GLOSSARY_DIR = os.path.join(GLOSSARY_DIR, 'presets')
 
 
 def get_build_metadata():
@@ -94,33 +96,7 @@ def create_task_workspace(task_id):
     return tempfile.mkdtemp(prefix=f"pdf_task_{task_id}_", dir=app.config['UPLOAD_FOLDER'])
 
 
-def load_glossary():
-    if not os.path.exists(GLOSSARY_PATH):
-        return []
-    try:
-        with open(GLOSSARY_PATH, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            data = data.get('terms', [])
-        if not isinstance(data, list):
-            return []
-        terms = []
-        seen = set()
-        for term in data:
-            clean = " ".join(str(term).strip().split())
-            if len(clean) < 2:
-                continue
-            key = clean.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            terms.append(clean)
-        return terms
-    except Exception:
-        return []
-
-
-def save_glossary(terms):
+def _normalize_terms(terms):
     clean_terms = []
     seen = set()
     for term in terms:
@@ -132,9 +108,123 @@ def save_glossary(terms):
             continue
         seen.add(key)
         clean_terms.append(clean)
-    with open(GLOSSARY_PATH, 'w', encoding='utf-8') as f:
-        json.dump({'terms': clean_terms}, f, ensure_ascii=False, indent=2)
     return clean_terms
+
+
+def _read_terms_file(path):
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            raw = f.read()
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = raw
+        if isinstance(data, dict):
+            data = data.get('terms', [])
+        if isinstance(data, str):
+            data = re.split(r'[\n,\t;]+', data)
+        if not isinstance(data, list):
+            return []
+        return _normalize_terms(data)
+    except Exception:
+        return []
+
+
+def _write_terms_file(path, terms):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump({'terms': _normalize_terms(terms)}, f, ensure_ascii=False, indent=2)
+
+
+def build_glossary_key(filename):
+    stem = os.path.splitext(secure_filename(filename or ''))[0].strip().lower()
+    return stem or 'document'
+
+
+def load_glossary():
+    if not os.path.exists(GLOSSARY_PATH):
+        return []
+    return _read_terms_file(GLOSSARY_PATH)
+
+
+def save_glossary(terms):
+    clean_terms = _normalize_terms(terms)
+    _write_terms_file(GLOSSARY_PATH, clean_terms)
+    return clean_terms
+
+
+def _preset_glossary_candidates(filename):
+    key = build_glossary_key(filename)
+    candidates = [
+        os.path.join(PRESET_GLOSSARY_DIR, f'{key}.json'),
+        os.path.join(PRESET_GLOSSARY_DIR, f'{key}.txt'),
+        os.path.join(BASE_DIR, f'{key}.glossary.json'),
+        os.path.join(BASE_DIR, f'{key}.glossary.txt'),
+    ]
+    return candidates
+
+
+def load_scoped_glossary(filename=None):
+    global_terms = load_glossary()
+    if not filename:
+        return {
+            'terms': global_terms,
+            'scope': 'global',
+            'source_label': '全局术语库',
+            'file_key': None,
+        }
+
+    key = build_glossary_key(filename)
+    file_path = os.path.join(GLOSSARY_DIR, f'{key}.json')
+    if os.path.exists(file_path):
+        terms = _read_terms_file(file_path)
+        return {
+            'terms': terms,
+            'scope': 'file',
+            'source_label': f'文件术语库: {key}',
+            'file_key': key,
+        }
+
+    for preset_path in _preset_glossary_candidates(filename):
+        if os.path.exists(preset_path):
+            terms = _read_terms_file(preset_path)
+            return {
+                'terms': terms,
+                'scope': 'preset',
+                'source_label': f'预设词表: {os.path.basename(preset_path)}',
+                'file_key': key,
+            }
+
+    return {
+        'terms': global_terms,
+        'scope': 'global',
+        'source_label': '全局术语库',
+        'file_key': key,
+    }
+
+
+def save_scoped_glossary(terms, filename=None):
+    clean_terms = _normalize_terms(terms)
+    if not filename:
+        save_glossary(clean_terms)
+        return {
+            'terms': clean_terms,
+            'scope': 'global',
+            'source_label': '全局术语库',
+            'file_key': None,
+        }
+
+    key = build_glossary_key(filename)
+    path = os.path.join(GLOSSARY_DIR, f'{key}.json')
+    _write_terms_file(path, clean_terms)
+    return {
+        'terms': clean_terms,
+        'scope': 'file',
+        'source_label': f'文件术语库: {key}',
+        'file_key': key,
+    }
 
 
 def extract_glossary_candidates(text, existing_terms=None, limit=15):
@@ -232,8 +322,12 @@ def analyze():
         translator = PDFTranslator()
         analysis = translator.analyze_pdf(filepath)
         doc = extract_pdf_text(filepath)
-        glossary_terms = load_glossary()
+        glossary_state = load_scoped_glossary(file.filename)
+        glossary_terms = glossary_state['terms']
         analysis['glossary_terms'] = glossary_terms
+        analysis['glossary_scope'] = glossary_state['scope']
+        analysis['glossary_source_label'] = glossary_state['source_label']
+        analysis['glossary_file_key'] = glossary_state['file_key']
         analysis['suggested_terms'] = extract_glossary_candidates(doc, glossary_terms)
 
         # 删除临时文件
@@ -287,7 +381,7 @@ def translate():
     target_lang = request.form.get('target_lang', 'en')
     task_id = normalize_task_id(request.form.get('task_id', ''))
     concurrency = int(request.form.get('concurrency', 4))  # 获取并发数，默认4
-    glossary_terms = parse_glossary_input(request.form.get('glossary_terms', '')) or load_glossary()
+    glossary_terms = parse_glossary_input(request.form.get('glossary_terms', '')) or load_scoped_glossary(file.filename)['terms']
 
     # 调试：打印并发参数
     print(f"[DEBUG] Received concurrency parameter: {concurrency}")
@@ -419,7 +513,7 @@ def translate_text():
     target_lang = request.form.get('target_lang', 'zh')
     task_id = normalize_task_id(request.form.get('task_id', ''))
     concurrency = int(request.form.get('concurrency', 4))
-    glossary_terms = parse_glossary_input(request.form.get('glossary_terms', '')) or load_glossary()
+    glossary_terms = parse_glossary_input(request.form.get('glossary_terms', '')) or load_scoped_glossary(file.filename)['terms']
 
     # 保存上传的文件到任务专属目录
     filename = secure_filename(file.filename)
@@ -623,12 +717,15 @@ def download(task_id, filename):
 @app.route('/glossary', methods=['GET', 'POST'])
 def glossary():
     if request.method == 'GET':
-        return jsonify({'terms': load_glossary()})
+        filename = request.args.get('filename', '').strip()
+        glossary_state = load_scoped_glossary(filename or None)
+        return jsonify(glossary_state)
 
     data = request.get_json(silent=True) or {}
     terms = data.get('terms', [])
-    saved = save_glossary(terms)
-    return jsonify({'status': 'ok', 'terms': saved})
+    filename = (data.get('filename') or '').strip()
+    saved = save_scoped_glossary(terms, filename or None)
+    return jsonify({'status': 'ok', **saved})
 
 if __name__ == '__main__':
     # 本地运行：python app.py

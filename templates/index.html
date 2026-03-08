@@ -140,10 +140,15 @@
                 <div class="glossary-section">
                     <div class="glossary-header">
                         <label for="glossaryTerms">专业术语库</label>
-                        <button type="button" class="btn-secondary" id="saveGlossaryBtn">保存术语库</button>
+                        <div class="glossary-actions">
+                            <button type="button" class="btn-secondary" id="importGlossaryBtn">导入术语库</button>
+                            <button type="button" class="btn-secondary" id="saveGlossaryBtn">保存术语库</button>
+                        </div>
                     </div>
+                    <div class="glossary-source" id="glossarySource">当前术语库：全局术语库</div>
                     <textarea id="glossaryTerms" name="glossary_terms" rows="6" placeholder="一行一个术语，例如：&#10;Animal Flow&#10;MMA&#10;Global Bodyweight Training"></textarea>
-                    <p class="glossary-note">高频专业术语会尽量保持原样不翻译。分析文件后会自动补充建议术语，你可以手动检查和编辑。</p>
+                    <input type="file" id="importGlossaryInput" accept=".json,.txt,.csv" hidden>
+                    <p class="glossary-note">优先级：文件术语库 > 预设词表 > 全局术语库。分析文件后会自动补充建议术语，你可以手动检查、导入并保存。</p>
                     <div class="glossary-suggestions" id="glossarySuggestions" hidden></div>
                 </div>
 

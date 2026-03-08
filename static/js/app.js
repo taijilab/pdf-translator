@@ -26,12 +26,16 @@ const comparisonContent = document.getElementById('processContent');
 const glossaryTermsInput = document.getElementById('glossaryTerms');
 const glossarySuggestions = document.getElementById('glossarySuggestions');
 const saveGlossaryBtn = document.getElementById('saveGlossaryBtn');
+const importGlossaryBtn = document.getElementById('importGlossaryBtn');
+const importGlossaryInput = document.getElementById('importGlossaryInput');
+const glossarySourceEl = document.getElementById('glossarySource');
 const versionBadge = document.getElementById('versionBadge');
 const buildBadge = document.getElementById('buildBadge');
 let currentTaskId = null;
 let eventSource = null;
 let translationStartTime = null;
 let elapsedTimeTimer = null;
+let currentGlossaryFilename = null;
 
 // 翻译对照数据
 let translationData = [];  // [{page_num, block_idx, original, translated}]
@@ -45,6 +49,12 @@ function parseGlossaryTerms(rawValue) {
 
 function setGlossaryTerms(terms) {
     glossaryTermsInput.value = [...new Set(terms.map(item => item.trim()).filter(Boolean))].join('\n');
+}
+
+function setGlossarySource(label) {
+    if (glossarySourceEl) {
+        glossarySourceEl.textContent = `当前术语库：${label || '全局术语库'}`;
+    }
 }
 
 function mergeGlossaryTerms(existingTerms, suggestedTerms) {
@@ -84,11 +94,13 @@ function renderGlossarySuggestions(terms) {
     glossarySuggestions.hidden = false;
 }
 
-async function loadGlossary() {
+async function loadGlossary(filename = '') {
     try {
-        const response = await fetch('/glossary');
+        const query = filename ? `?filename=${encodeURIComponent(filename)}` : '';
+        const response = await fetch(`/glossary${query}`);
         const data = await response.json();
         setGlossaryTerms(data.terms || []);
+        setGlossarySource(data.source_label);
     } catch (error) {
         console.error('Failed to load glossary:', error);
     }
@@ -120,17 +132,34 @@ async function saveGlossary() {
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ terms })
+            body: JSON.stringify({ terms, filename: currentGlossaryFilename })
         });
         const data = await response.json();
         if (!response.ok) {
             throw new Error(data.error || '保存术语库失败');
         }
         setGlossaryTerms(data.terms || []);
+        setGlossarySource(data.source_label);
         showMessage('术语库已保存', 'success');
     } catch (error) {
         showMessage(error.message || '保存术语库失败', 'error');
     }
+}
+
+function parseImportedGlossaryText(rawText) {
+    const text = String(rawText || '').trim();
+    if (!text) return [];
+    try {
+        const parsed = JSON.parse(text);
+        if (Array.isArray(parsed)) return parseGlossaryTerms(parsed.join('\n'));
+        if (parsed && Array.isArray(parsed.terms)) return parseGlossaryTerms(parsed.terms.join('\n'));
+    } catch (_) {
+        // fall through
+    }
+    return text
+        .split(/[\n,\t;]+/)
+        .map(item => item.trim())
+        .filter(Boolean);
 }
 
 // 从localStorage恢复上次的设置
@@ -194,6 +223,25 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (saveGlossaryBtn) {
         saveGlossaryBtn.addEventListener('click', saveGlossary);
+    }
+    if (importGlossaryBtn && importGlossaryInput) {
+        importGlossaryBtn.addEventListener('click', () => importGlossaryInput.click());
+        importGlossaryInput.addEventListener('change', async (event) => {
+            const glossaryFile = event.target.files[0];
+            if (!glossaryFile) return;
+            try {
+                const text = await glossaryFile.text();
+                const importedTerms = parseImportedGlossaryText(text);
+                const merged = mergeGlossaryTerms(parseGlossaryTerms(glossaryTermsInput.value), importedTerms);
+                setGlossaryTerms(merged);
+                setGlossarySource(`${glossaryFile.name}（已导入，未保存）`);
+                showMessage(`已导入术语库：${glossaryFile.name}`, 'success');
+            } catch (error) {
+                showMessage('导入术语库失败', 'error');
+            } finally {
+                importGlossaryInput.value = '';
+            }
+        });
     }
 });
 
@@ -402,8 +450,10 @@ dropArea.addEventListener('drop', (e) => {
 // 处理文件
 async function handleFile(file) {
     if (file) {
+        currentGlossaryFilename = file.name;
         resetProgressStats();
         fileInfo.textContent = `已选择: ${file.name} (${formatFileSize(file.size)})`;
+        await loadGlossary(file.name);
 
         // 分析文件
         try {
@@ -443,6 +493,7 @@ async function handleFile(file) {
                 const merged = mergeGlossaryTerms(data.glossary_terms, data.suggested_terms || []);
                 setGlossaryTerms(merged);
             }
+            setGlossarySource(data.glossary_source_label);
             renderGlossarySuggestions(data.suggested_terms || []);
 
             // 根据检测到的语言自动设置源语言
