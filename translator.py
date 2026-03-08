@@ -456,15 +456,119 @@ class PDFTranslator:
                 continue
         return registered
 
+    def _pdf_color_to_rgb(self, color_value):
+        if isinstance(color_value, tuple) and len(color_value) == 3:
+            return color_value
+        if not isinstance(color_value, int):
+            return (0, 0, 0)
+        r = ((color_value >> 16) & 255) / 255.0
+        g = ((color_value >> 8) & 255) / 255.0
+        b = (color_value & 255) / 255.0
+        return (r, g, b)
+
+    def _looks_light_color(self, color_value):
+        r, g, b = self._pdf_color_to_rgb(color_value)
+        return (r + g + b) / 3 >= 0.72
+
+    def _extract_span_style_hints(self, page):
+        span_hints = []
+        try:
+            text_dict = page.get_text("dict")
+        except Exception:
+            return span_hints
+
+        for block in text_dict.get('blocks', []):
+            if block.get('type') != 0:
+                continue
+            for line in block.get('lines', []):
+                for span in line.get('spans', []):
+                    text = self._normalize_extracted_block_text(span.get('text', ''))
+                    if not text:
+                        continue
+                    span_hints.append({
+                        'rect': fitz.Rect(span['bbox']),
+                        'text': text,
+                        'font': span.get('font', 'helv'),
+                        'size': span.get('size', 11),
+                        'flags': span.get('flags', 0),
+                        'color': span.get('color', 0),
+                    })
+        return span_hints
+
+    def _apply_block_style_hints(self, page_blocks, span_hints):
+        if not page_blocks or not span_hints:
+            return page_blocks
+
+        for block in page_blocks:
+            block_rect = block['rect']
+            overlaps = []
+            for span in span_hints:
+                inter = block_rect & span['rect']
+                if inter.is_empty:
+                    continue
+                overlaps.append((inter.get_area(), span))
+            if not overlaps:
+                continue
+
+            overlaps.sort(key=lambda item: (-item[0], item[1]['rect'].y0, item[1]['rect'].x0))
+            best_span = overlaps[0][1]
+            block.setdefault('font_info', {}).update({
+                'font': best_span.get('font', 'helv'),
+                'size': best_span.get('size', 11),
+                'flags': best_span.get('flags', 0),
+                'color': best_span.get('color', 0),
+            })
+        return page_blocks
+
+    def _copy_vector_drawings(self, source_page, target_page):
+        try:
+            drawings = source_page.get_drawings()
+        except Exception:
+            return
+
+        for drawing in drawings:
+            rect = drawing.get('rect')
+            if not rect:
+                continue
+
+            fill = drawing.get('fill')
+            color = drawing.get('color')
+            width = drawing.get('width') or 0
+            fill_opacity = drawing.get('fill_opacity', 1.0)
+            stroke_opacity = drawing.get('stroke_opacity', 1.0)
+            drawing_type = drawing.get('type')
+
+            try:
+                if drawing_type in ('f', 'fs', 'sf'):
+                    target_page.draw_rect(
+                        rect,
+                        color=color,
+                        fill=fill,
+                        width=width,
+                        fill_opacity=fill_opacity,
+                        stroke_opacity=stroke_opacity,
+                        overlay=True,
+                    )
+                elif drawing_type == 's':
+                    target_page.draw_rect(
+                        rect,
+                        color=color,
+                        width=width,
+                        stroke_opacity=stroke_opacity,
+                        overlay=True,
+                    )
+            except Exception:
+                continue
+
     def _build_font_candidates(self, registered_fonts, translated_text, original_font, is_bold, is_italic, is_chinese):
         has_latin = bool(re.search(r'[A-Za-z0-9]', translated_text))
 
         if is_chinese:
             base = []
             if has_latin:
-                base.extend([name for name in ('ui_unicode', 'ui_cjk', 'ui_heiti') if name in registered_fonts])
+                base.extend([name for name in ('ui_unicode', 'ui_heiti', 'ui_cjk') if name in registered_fonts])
             else:
-                base.extend([name for name in ('ui_cjk', 'ui_heiti', 'ui_unicode') if name in registered_fonts])
+                base.extend([name for name in ('ui_unicode', 'ui_heiti', 'ui_cjk') if name in registered_fonts])
             base.extend(['china-s', 'china-t', 'china-ss'])
             return base
 
@@ -1613,6 +1717,7 @@ class PDFTranslator:
                         blocks = page.get_text("blocks")
                         blocks.sort(key=lambda b: (b[1], b[0]))
                         page_blocks = []
+                        span_hints = self._extract_span_style_hints(page)
 
                         for block_idx, block in enumerate(blocks):
                             if block[6] != 0:
@@ -1636,6 +1741,7 @@ class PDFTranslator:
                                 'font_info': {}
                             })
 
+                        page_blocks = self._apply_block_style_hints(page_blocks, span_hints)
                         raw_image_page_blocks += len(page_blocks)
                         is_toc_page = self._is_toc_like_page(page_blocks)
                         if is_toc_page:
@@ -2161,6 +2267,7 @@ class PDFTranslator:
                         new_page.set_rotation(rotation)
                     new_page.draw_rect(new_page.rect, color=(1, 1, 1), fill=(1, 1, 1))
                     page_registered_fonts = self._register_page_fonts(new_page)
+                    self._copy_vector_drawings(page, new_page)
                 except Exception as page_setup_err:
                     self._add_log(f'第{page_num+1}页初始化失败（已跳过）: {page_setup_err}', 'error')
                     continue
@@ -2291,16 +2398,30 @@ class PDFTranslator:
                         if layout_hint == 'toc':
                             toc_fonts = [name for name in ('ui_unicode', 'ui_cjk', 'ui_heiti', 'helv') if name in font_names or name in page_registered_fonts]
                             font_names = toc_fonts + [name for name in font_names if name not in toc_fonts]
+                        elif layout_hint in ('caption', 'heading', 'short'):
+                            heading_fonts = [name for name in ('ui_unicode', 'ui_heiti', 'ui_cjk', 'helv') if name in font_names or name in page_registered_fonts]
+                            font_names = heading_fonts + [name for name in font_names if name not in heading_fonts]
 
-                        # 使用原始字体大小（中文适当缩小）
-                        if is_chinese:
-                            base_fontsize = max(6, original_size * 0.85)
+                        # 标题、图注和短标签优先保留原始字号，正文再适度缩小。
+                        if layout_hint in ('caption', 'heading', 'short'):
+                            if is_chinese:
+                                base_fontsize = max(7, original_size * 0.98)
+                            else:
+                                base_fontsize = max(7, original_size)
+                        elif is_chinese:
+                            base_fontsize = max(6, original_size * 0.88)
                         else:
                             base_fontsize = max(6, original_size * 0.95)
                         if layout_hint == 'toc':
                             base_fontsize = max(6, base_fontsize * 0.85)
-                        font_sizes = [base_fontsize, base_fontsize * 0.85, base_fontsize * 0.7, 6]
-                        text_color = (1, 1, 1) if text_rect.y0 < image_top_band else (0, 0, 0)
+                        font_sizes = [base_fontsize, base_fontsize * 0.92, base_fontsize * 0.84, base_fontsize * 0.76, 6]
+                        original_color = font_info.get('color', 0)
+                        if self._looks_light_color(original_color):
+                            text_color = self._pdf_color_to_rgb(original_color)
+                        elif text_rect.y0 < image_top_band:
+                            text_color = (1, 1, 1)
+                        else:
+                            text_color = self._pdf_color_to_rgb(original_color)
                         next_top = None
                         if idx + 1 < len(page_translations):
                             next_top = page_translations[idx + 1][0].y0
