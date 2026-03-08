@@ -1,6 +1,9 @@
 from flask import Flask, render_template, request, send_file, after_this_request, jsonify, Response
 from werkzeug.utils import secure_filename
 import os
+import subprocess
+import shutil
+import fitz
 from translator import PDFTranslator
 import tempfile
 import queue
@@ -9,11 +12,56 @@ import json
 import re
 import time
 import uuid
+from collections import Counter
 
-app = Flask(__name__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app = Flask(
+    __name__,
+    template_folder=os.path.join(BASE_DIR, 'templates'),
+    static_folder=os.path.join(BASE_DIR, 'static')
+)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB max file size
 app.config['UPLOAD_FOLDER'] = tempfile.gettempdir()
 app.config['ALLOWED_EXTENSIONS'] = {'pdf'}
+
+
+def _read_git_value(args, fallback):
+    cmd = list(args)
+    if cmd and cmd[0] == 'git':
+        git_bin = '/usr/bin/git' if os.path.exists('/usr/bin/git') else (shutil.which('git') or 'git')
+        cmd[0] = git_bin
+    try:
+        return subprocess.check_output(cmd, cwd=BASE_DIR, text=True).strip()
+    except Exception:
+        return fallback
+
+
+GLOSSARY_PATH = os.path.join(BASE_DIR, 'glossary.json')
+
+
+def get_build_metadata():
+    app_version = os.environ.get('PDFAPP_VERSION', 'v1.0.0')
+    build_number = os.environ.get('PDFAPP_BUILD') or _read_git_value(['git', 'rev-list', '--count', 'HEAD'], '0')
+    build_commit = os.environ.get('PDFAPP_COMMIT') or _read_git_value(['git', 'rev-parse', '--short', 'HEAD'], 'dev')
+    build_label = f'build {build_number} ({build_commit})'
+    return {
+        'app_version': app_version,
+        'build_number': build_number,
+        'build_commit': build_commit,
+        'build_label': build_label,
+    }
+
+
+@app.after_request
+def add_no_cache_headers(response):
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    build = get_build_metadata()
+    response.headers['X-App-Build'] = f"{build['build_number']} ({build['build_commit']})"
+    return response
+
+
 @app.errorhandler(413)
 def request_entity_too_large(e):
     return jsonify({'error': '文件过大（超过200MB），请压缩PDF后再试'}), 413
@@ -45,9 +93,113 @@ def create_task_workspace(task_id):
     """为任务创建独立临时目录。"""
     return tempfile.mkdtemp(prefix=f"pdf_task_{task_id}_", dir=app.config['UPLOAD_FOLDER'])
 
+
+def load_glossary():
+    if not os.path.exists(GLOSSARY_PATH):
+        return []
+    try:
+        with open(GLOSSARY_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data = data.get('terms', [])
+        if not isinstance(data, list):
+            return []
+        terms = []
+        seen = set()
+        for term in data:
+            clean = " ".join(str(term).strip().split())
+            if len(clean) < 2:
+                continue
+            key = clean.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            terms.append(clean)
+        return terms
+    except Exception:
+        return []
+
+
+def save_glossary(terms):
+    clean_terms = []
+    seen = set()
+    for term in terms:
+        clean = " ".join(str(term).strip().split())
+        if len(clean) < 2:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        clean_terms.append(clean)
+    with open(GLOSSARY_PATH, 'w', encoding='utf-8') as f:
+        json.dump({'terms': clean_terms}, f, ensure_ascii=False, indent=2)
+    return clean_terms
+
+
+def extract_glossary_candidates(text, existing_terms=None, limit=15):
+    existing_terms = {term.lower() for term in (existing_terms or [])}
+    pattern = re.compile(
+        r'\b(?:[A-Z][A-Za-z0-9&®\-]+|[A-Z]{2,})(?:\s+(?:[A-Z][A-Za-z0-9&®\-]+|[A-Z]{2,})){0,3}\b'
+    )
+    candidates = []
+    for match in pattern.finditer(text):
+        term = " ".join(match.group(0).split())
+        if len(term) < 2 or len(term) > 60:
+            continue
+        if term.lower() in existing_terms:
+            continue
+        if re.fullmatch(r'Page \d+ of \d+', term):
+            continue
+        candidates.append(term)
+
+    counts = Counter(candidates)
+    ranked = [
+        term for term, count in counts.most_common()
+        if count >= 2 and not re.fullmatch(r'(Chapter|Page|Appendix)\s+\w+', term)
+    ]
+    return ranked[:limit]
+
+
+def parse_glossary_input(raw_glossary):
+    if not raw_glossary:
+        return []
+    if isinstance(raw_glossary, list):
+        return raw_glossary
+    try:
+        parsed = json.loads(raw_glossary)
+        if isinstance(parsed, list):
+            return parsed
+    except Exception:
+        pass
+    return [line.strip() for line in str(raw_glossary).splitlines() if line.strip()]
+
+
+def extract_pdf_text(filepath):
+    try:
+        doc = fitz.open(filepath)
+        parts = [page.get_text("text") for page in doc]
+        doc.close()
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
 @app.route('/')
 def index():
-    return render_template('index.html')
+    build = get_build_metadata()
+    return render_template(
+        'index.html',
+        app_version=build['app_version'],
+        build_number=build['build_number'],
+        build_commit=build['build_commit'],
+        build_label=build['build_label'],
+        glossary_terms=load_glossary()
+    )
+
+
+@app.route('/version')
+def version():
+    return jsonify(get_build_metadata())
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
@@ -79,6 +231,10 @@ def analyze():
         # 分析PDF
         translator = PDFTranslator()
         analysis = translator.analyze_pdf(filepath)
+        doc = extract_pdf_text(filepath)
+        glossary_terms = load_glossary()
+        analysis['glossary_terms'] = glossary_terms
+        analysis['suggested_terms'] = extract_glossary_candidates(doc, glossary_terms)
 
         # 删除临时文件
         os.remove(filepath)
@@ -131,6 +287,7 @@ def translate():
     target_lang = request.form.get('target_lang', 'en')
     task_id = normalize_task_id(request.form.get('task_id', ''))
     concurrency = int(request.form.get('concurrency', 4))  # 获取并发数，默认4
+    glossary_terms = parse_glossary_input(request.form.get('glossary_terms', '')) or load_glossary()
 
     # 调试：打印并发参数
     print(f"[DEBUG] Received concurrency parameter: {concurrency}")
@@ -187,7 +344,8 @@ def translate():
                 api_key=api_key if api_key else None,
                 progress_callback=progress_callback,
                 log_callback=log_callback,
-                cancel_callback=check_cancelled
+                cancel_callback=check_cancelled,
+                glossary_terms=glossary_terms
             )
 
             # 发送初始化日志
@@ -261,6 +419,7 @@ def translate_text():
     target_lang = request.form.get('target_lang', 'zh')
     task_id = normalize_task_id(request.form.get('task_id', ''))
     concurrency = int(request.form.get('concurrency', 4))
+    glossary_terms = parse_glossary_input(request.form.get('glossary_terms', '')) or load_glossary()
 
     # 保存上传的文件到任务专属目录
     filename = secure_filename(file.filename)
@@ -313,7 +472,8 @@ def translate_text():
                 api_key=api_key if api_key else None,
                 progress_callback=progress_callback,
                 log_callback=log_callback,
-                cancel_callback=check_cancelled
+                cancel_callback=check_cancelled,
+                glossary_terms=glossary_terms
             )
 
             # 发送初始化日志
@@ -458,6 +618,17 @@ def download(task_id, filename):
         download_name=filename,
         mimetype=mimetype
     )
+
+
+@app.route('/glossary', methods=['GET', 'POST'])
+def glossary():
+    if request.method == 'GET':
+        return jsonify({'terms': load_glossary()})
+
+    data = request.get_json(silent=True) or {}
+    terms = data.get('terms', [])
+    saved = save_glossary(terms)
+    return jsonify({'status': 'ok', 'terms': saved})
 
 if __name__ == '__main__':
     # 本地运行：python app.py

@@ -3,13 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PDF 翻译工具</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=5">
+    <title>PDF 翻译工具 {{ app_version }} | {{ build_label }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v={{ build_commit }}">
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>📄 PDF 翻译工具</h1>
+            <h1>
+                <span>📄 PDF 翻译工具</span>
+                <span class="version-badge" id="versionBadge">Version {{ app_version }}</span>
+                <span class="build-badge" id="buildBadge">Build {{ build_number }} ({{ build_commit }})</span>
+            </h1>
             <p class="subtitle">上传PDF文件，自动翻译并保持格式</p>
         </header>
 
@@ -132,6 +136,16 @@
                 <p class="settings-note">
                     💡 <strong>提示</strong>: 并发数越高速度越快，但可能触发API限制。建议：Google翻译使用2-4，付费API可用4-10。
                 </p>
+
+                <div class="glossary-section">
+                    <div class="glossary-header">
+                        <label for="glossaryTerms">专业术语库</label>
+                        <button type="button" class="btn-secondary" id="saveGlossaryBtn">保存术语库</button>
+                    </div>
+                    <textarea id="glossaryTerms" name="glossary_terms" rows="6" placeholder="一行一个术语，例如：&#10;Animal Flow&#10;MMA&#10;Global Bodyweight Training"></textarea>
+                    <p class="glossary-note">高频专业术语会尽量保持原样不翻译。分析文件后会自动补充建议术语，你可以手动检查和编辑。</p>
+                    <div class="glossary-suggestions" id="glossarySuggestions" hidden></div>
+                </div>
 
                 <div class="button-group">
                     <button type="submit" class="btn-primary" id="translateBtn">
@@ -271,6 +285,6 @@
         </footer>
     </div>
 
-    <script src="{{ url_for('static', filename='js/app.js') }}?v=7"></script>
+    <script src="{{ url_for('static', filename='js/app.js') }}?v={{ build_commit }}"></script>
 </body>
 </html>

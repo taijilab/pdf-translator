@@ -5,8 +5,17 @@ import io
 import re
 import os
 import time
+import html
+import json
+from difflib import SequenceMatcher
 
 class PDFTranslator:
+    SYSTEM_FONT_CANDIDATES = [
+        ('ui_cjk', '/System/Library/Fonts/Supplemental/Songti.ttc'),
+        ('ui_heiti', '/System/Library/Fonts/STHeiti Light.ttc'),
+        ('ui_unicode', '/Library/Fonts/Arial Unicode.ttf'),
+    ]
+
     # API价格（每1M tokens的价格，单位：美元）
     PRICING = {
         'google': {
@@ -35,7 +44,7 @@ class PDFTranslator:
         }
     }
 
-    def __init__(self, api_type='google', api_key=None, progress_callback=None, log_callback=None, cancel_callback=None):
+    def __init__(self, api_type='google', api_key=None, progress_callback=None, log_callback=None, cancel_callback=None, glossary_terms=None):
         self.api_type = api_type
         self.api_key = api_key
         self.progress_callback = progress_callback
@@ -46,6 +55,7 @@ class PDFTranslator:
         self.translator = None  # 初始化为None
         self._translation_cache = {}  # 翻译缓存：(text, src, tgt) -> translated
         self._session = requests.Session()  # 复用 HTTP 连接，减少握手开销
+        self.glossary_terms = self._normalize_glossary_terms(glossary_terms or [])
 
         # 只在需要时初始化translator
         if self.api_type == 'google':
@@ -55,6 +65,23 @@ class PDFTranslator:
         """设置翻译器"""
         # deep-translator 不需要预先设置translator实例
         pass
+
+    def _normalize_glossary_terms(self, terms):
+        seen = set()
+        normalized = []
+        for term in terms:
+            if not term:
+                continue
+            clean = " ".join(str(term).strip().split())
+            if len(clean) < 2:
+                continue
+            key = clean.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(clean)
+        normalized.sort(key=len, reverse=True)
+        return normalized
 
     def _is_translatable(self, text):
         """判断文本块是否需要翻译；跳过纯数字/符号/极短文本，节省 API 调用"""
@@ -77,6 +104,13 @@ class PDFTranslator:
 
         for block in all_blocks:
             text_len = len(block['text'].strip())
+            layout_hint = block.get('font_info', {}).get('layout_hint', 'body')
+            if layout_hint != 'body':
+                if current_group:
+                    groups.append(('batch', current_group))
+                    current_group, current_len = [], 0
+                groups.append(('single', [block]))
+                continue
             if text_len >= short_threshold:
                 # 长文本块：先把当前积累的短块入队，再单独处理
                 if current_group:
@@ -97,6 +131,460 @@ class PDFTranslator:
             groups.append(('batch', current_group))
 
         return groups
+
+    def _should_use_fast_block_extraction(self, total_pages, file_size_mb):
+        """大文件优先使用 blocks 提取，减少 dict/span 解析开销。"""
+        return total_pages >= 30 or file_size_mb >= 8
+
+    def _should_emit_detail_log(self, current, total):
+        """大任务只抽样输出块级原文/译文日志，避免 SSE 和前端渲染过载。"""
+        if total <= 200:
+            return True
+        if current <= 8 or current > total - 8:
+            return True
+        step = 25 if total <= 1000 else 50
+        return current % step == 0
+
+    def _should_emit_progress_update(self, current, total):
+        """大任务降低进度推送频率，减少队列和前端更新压力。"""
+        if total <= 200:
+            return True
+        if current <= 5 or current == total:
+            return True
+        step = 10 if total <= 1000 else 20
+        return current % step == 0
+
+    def _build_text_page_runs(self, text_pages, max_chars=12000):
+        """把连续纯文字页合并成翻译 run，减少 API 调用。"""
+        runs = []
+        current_run = []
+        current_chars = 0
+
+        for page_info in text_pages:
+            text_len = len(page_info['text'])
+            is_consecutive = not current_run or page_info['page_num'] == current_run[-1]['page_num'] + 1
+
+            if current_run and (not is_consecutive or current_chars + text_len > max_chars):
+                runs.append(current_run)
+                current_run = []
+                current_chars = 0
+
+            current_run.append(page_info)
+            current_chars += text_len
+
+        if current_run:
+            runs.append(current_run)
+
+        return runs
+
+    def _normalize_extracted_block_text(self, text):
+        """规范化提取出的块文本，减少字体私有区符号导致的乱码。"""
+        if not text:
+            return text
+        return text.replace('\uf0a7', '•').replace('', '•')
+
+    def _is_page_footer_text(self, text):
+        stripped = " ".join(text.strip().split())
+        return bool(re.match(r'^Page\s+\d+\s+of\s+\d+$', stripped, re.IGNORECASE))
+
+    def _translate_special_text(self, text, target_lang):
+        """对页码等固定结构做本地稳定转换，避免交给模型后被改乱。"""
+        stripped = " ".join(text.strip().split())
+        match = re.match(r'^Page\s+(\d+)\s+of\s+(\d+)$', stripped, re.IGNORECASE)
+        if match:
+            page_no, total_pages = match.groups()
+            if target_lang == 'zh':
+                return f'第 {page_no} 页，共 {total_pages} 页'
+            return stripped
+        return None
+
+    def _contains_long_english_run(self, text):
+        normalized = " ".join(text.split())
+        return bool(re.search(r'(?:[A-Za-z][A-Za-z\'’\-]{1,}(?:[\s\-/&,;:().]+|$)){6,}', normalized))
+
+    def _contains_meta_translation_note(self, text):
+        normalized = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+        patterns = [
+            r'严格遵循',
+            r'处理原则',
+            r'处理方式',
+            r'符合以下',
+            r'未添加额外说明',
+            r'完全符合要求',
+            r'章节编号采用',
+            r'括号使用',
+            r'保留原排版',
+            r'英文句子彻底转化',
+            r'根据硬性要求',
+            r'注释[:：]',
+            r'(?m)^\d+\.\s+',
+        ]
+        return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns)
+
+    def _has_repeated_lines(self, text):
+        lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+        if len(lines) < 4:
+            return False
+        seen = {}
+        for line in lines:
+            key = line.lower()
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] >= 2 and len(line) >= 12:
+                return True
+        return False
+
+    def _translate_text_openrouter_force_chinese(self, text, target_lang='zh'):
+        """OpenRouter 二次强制重翻，尽量消除长英文残留。"""
+        text = self._clean_text(text)
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json; charset=utf-8",
+            "HTTP-Referer": "https://pdf-translator.local",
+        }
+
+        lang_names = {
+            'en': '英语',
+            'zh': '中文',
+            'ja': '日语',
+            'ko': '韩语',
+            'fr': '法语',
+            'de': '德语',
+            'es': '西班牙语',
+            'ru': '俄语',
+            'ar': '阿拉伯语'
+        }
+        target_lang_name = lang_names.get(target_lang, target_lang)
+        prompt = (
+            f"将下面内容完整翻译成{target_lang_name}。\n"
+            "硬性要求：\n"
+            "1. 除 URL、页码、明确品牌名外，不允许保留英文句子。\n"
+            "2. 如果输出中还有完整英文短语或英文句子，视为失败。\n"
+            "3. 保留段落、项目符号和换行结构。\n"
+            "4. 只返回译文本身，不要解释。\n\n"
+            f"{text}"
+        )
+        data = {
+            "model": "deepseek/deepseek-chat",
+            "messages": [
+                {"role": "system", "content": "你是严格的中文翻译引擎。必须输出完整中文译文，不能保留整句英文。"},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0
+        }
+        response = self._session.post(url, headers=headers, json=data, timeout=75)
+        result = response.json()
+        if 'choices' in result and result['choices']:
+            return self._normalize_translated_text(result['choices'][0]['message']['content'].strip())
+        raise Exception(f"API Error: {result}")
+
+    def _split_text_for_strict_retry(self, text, max_chars=260):
+        """把长文本拆成更稳的小段，降低模型漏译后半段的概率。"""
+        chunks = []
+        current = ""
+        paragraphs = [part for part in re.split(r'(\n+)', text) if part]
+
+        def flush():
+            nonlocal current
+            if current.strip():
+                chunks.append(current.strip())
+            current = ""
+
+        for part in paragraphs:
+            if part.startswith('\n'):
+                if len(current) + len(part) <= max_chars:
+                    current += part
+                else:
+                    flush()
+                continue
+
+            sentences = re.split(r'(?<=[\.\?!。！？:：;；])\s+', part)
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                addition = sentence if not current else f"{current} {sentence}"
+                if len(addition) <= max_chars:
+                    current = addition
+                else:
+                    flush()
+                    if len(sentence) <= max_chars:
+                        current = sentence
+                    else:
+                        for i in range(0, len(sentence), max_chars):
+                            chunks.append(sentence[i:i + max_chars])
+        flush()
+        return chunks or [text]
+
+    def _strict_translate_text(self, text, source_lang, target_lang):
+        """严格翻译：失败时继续缩块重试，而不是直接回退原文。"""
+        special_text = self._translate_special_text(text, target_lang)
+        if special_text is not None:
+            return special_text
+
+        if self.api_type == 'openrouter':
+            direct = self._translate_text_openrouter_force_chinese(text, target_lang)
+            if not self._should_retry_translation(text, direct, target_lang):
+                return direct
+
+            translated_chunks = []
+            for chunk in self._split_text_for_strict_retry(text):
+                translated_chunks.append(self._translate_text_openrouter_force_chinese(chunk, target_lang))
+            return self._normalize_translated_text("\n".join(translated_chunks))
+
+        if self.api_type == 'google':
+            return self._translate_text_google(text, source_lang, target_lang)
+
+        return self._translate_text(text, source_lang, target_lang)
+
+    def _is_toc_like_line(self, text):
+        normalized = " ".join(text.strip().split())
+        return bool(
+            re.search(r'\b\d+$', normalized) or
+            re.match(r'^(Chapter|Appendix|Table of Contents|Disclaimers|Welcome|How to Use)', normalized, re.IGNORECASE)
+        )
+
+    def _is_toc_like_page(self, page_blocks):
+        if not page_blocks:
+            return False
+        joined = "\n".join(block['text'] for block in page_blocks)
+        if 'TABLE OF CONTENTS' in joined.upper():
+            return True
+        toc_lines = sum(1 for block in page_blocks if self._is_toc_like_line(block['text']))
+        return toc_lines >= max(5, int(len(page_blocks) * 0.45))
+
+    def _should_retry_translation(self, source_text, translated_text, target_lang):
+        if target_lang != 'zh':
+            return False
+        source = " ".join(source_text.strip().split())
+        translated = " ".join(translated_text.strip().split())
+        if not source or not translated:
+            return False
+
+        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', translated))
+        ascii_chars = len(re.findall(r'[A-Za-z]', translated))
+        source_ascii_chars = len(re.findall(r'[A-Za-z]', source))
+        similarity = SequenceMatcher(None, source.lower(), translated.lower()).ratio()
+
+        if similarity >= 0.72 and chinese_chars < max(8, len(translated) * 0.08):
+            return True
+        if self._contains_long_english_run(translated):
+            return True
+        if ascii_chars > chinese_chars * 4 and similarity >= 0.55:
+            return True
+        if source_ascii_chars >= 12 and chinese_chars == 0 and ascii_chars >= max(10, source_ascii_chars * 0.6):
+            return True
+        if source_ascii_chars >= 24 and chinese_chars < 6 and similarity >= 0.35:
+            return True
+        if source_ascii_chars >= 40 and ascii_chars >= 24:
+            return True
+        if self._has_repeated_lines(translated):
+            return True
+        if self._contains_meta_translation_note(translated):
+            return True
+        return False
+
+    def _ensure_target_translation(self, source_text, translated_text, source_lang, target_lang):
+        translated_text = self._normalize_translated_text(translated_text)
+        if not self._should_retry_translation(source_text, translated_text, target_lang):
+            return translated_text
+
+        retried = translated_text
+        for _ in range(2):
+            if self.api_type == 'google':
+                retried = self._translate_text_google(source_text, source_lang, target_lang)
+            elif self.api_type == 'openrouter':
+                retried = self._translate_text_openrouter_force_chinese(source_text, target_lang)
+            else:
+                retried = self._translate_text(source_text, source_lang, target_lang)
+
+            retried = self._normalize_translated_text(retried if retried else translated_text)
+            if not self._should_retry_translation(source_text, retried, target_lang):
+                return retried
+
+        return retried
+
+    def _normalize_translated_text(self, text):
+        if not text:
+            return text
+
+        text = text.replace('\x00', '')
+        text = text.replace('?', '？') if re.search(r'[A-Za-z]\?[A-Za-z]', text) else text
+        text = text.replace('�', '')
+        def collapse_spaced_letters(match):
+            fragment = match.group(0)
+            pieces = fragment.split()
+            if len(pieces) < 3 or any(not piece.isalpha() or len(piece) > 2 for piece in pieces):
+                return fragment
+            collapsed = ''.join(pieces)
+            collapsed = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', collapsed)
+            return collapsed
+
+        def collapse_spaced_digits(match):
+            pieces = match.group(0).split()
+            return ''.join(pieces)
+
+        text = text.replace('•  ', '• ')
+        text = re.sub(r'(?<!\S)(?:[A-Za-z]{1,2}\s+){2,}[A-Za-z]{1,2}(?!\S)', collapse_spaced_letters, text)
+        text = re.sub(r'(?<!\S)(?:\d\s+){1,}\d(?!\S)', collapse_spaced_digits, text)
+        text = re.sub(r'([A-Za-z0-9])\s+\.\s+(?=[A-Za-z0-9])', r'\1.', text)
+        text = re.sub(r'([:/._-])\s+(?=[A-Za-z0-9])', r'\1', text)
+        text = re.sub(r'(?<=[A-Za-z0-9])\s+([:/._-])', r'\1', text)
+        text = re.sub(r'\bW\s+W\s+W\b', 'WWW', text, flags=re.IGNORECASE)
+        text = re.sub(r'(?i)w\s+w\s+w\s*\.\s*', 'www.', text)
+        text = re.sub(r'\s+\)', ')', text)
+        text = re.sub(r'\(\s+', '(', text)
+        text = re.sub(r'\n?注释[:：]\n?(?:\d+\.\s*.*(?:\n|$)){1,6}', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'\n?说明[:：]\n?(?:[-•\d].*(?:\n|$)){1,6}', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'[\(（]保留原排版.*?[\)）]', '', text)
+        text = re.sub(r'(?m)^(?:注[:：]|输出[:：]?|翻译[:：]?|完全符合要求.*|严格遵循要求.*|章节编号.*|括号使用.*|空行结构.*)$', '', text)
+        text = re.sub(r'(?m)^\d+\.\s*(?:严格遵循要求.*|确保未出现.*|数字.*|空行结构.*|完全符合.*)$', '', text)
+        text = re.sub(r'（注：.*?）', '', text, flags=re.DOTALL)
+        text = re.sub(r'\(注：.*?\)', '', text, flags=re.DOTALL)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
+
+    def _register_page_fonts(self, page):
+        registered = []
+        for font_name, font_path in self.SYSTEM_FONT_CANDIDATES:
+            if not os.path.exists(font_path):
+                continue
+            try:
+                page.insert_font(fontname=font_name, fontfile=font_path)
+                registered.append(font_name)
+            except Exception:
+                continue
+        return registered
+
+    def _build_font_candidates(self, registered_fonts, translated_text, original_font, is_bold, is_italic, is_chinese):
+        has_latin = bool(re.search(r'[A-Za-z0-9]', translated_text))
+
+        if is_chinese:
+            base = []
+            if has_latin:
+                base.extend([name for name in ('ui_unicode', 'ui_cjk', 'ui_heiti') if name in registered_fonts])
+            else:
+                base.extend([name for name in ('ui_cjk', 'ui_heiti', 'ui_unicode') if name in registered_fonts])
+            base.extend(['china-s', 'china-t', 'china-ss'])
+            return base
+
+        if original_font and 'Times' in original_font:
+            return ['times-roman', 'times-italic', 'times-bold', 'helv']
+        if original_font and 'Helv' in original_font:
+            return ['helv', 'helv-bold', 'times-roman']
+        if original_font and 'Courier' in original_font:
+            return ['courier', 'courier-bold', 'helv']
+        if is_bold and is_italic:
+            return ['helv-bolditalic', 'helv-bold', 'helv']
+        if is_bold:
+            return ['helv-bold', 'helv', 'times-bold']
+        if is_italic:
+            return ['helv-italic', 'helv', 'times-italic']
+        return ['helv', 'times-roman', 'courier']
+
+    def _classify_block_for_merge(self, block):
+        text = block['text'].strip()
+        normalized = " ".join(text.split())
+        rect = block['rect']
+        width = max(1, rect.width)
+        x0 = rect.x0
+
+        is_footer = self._is_page_footer_text(text)
+        starts_bullet = bool(re.match(r'^[•●◆◾▪◦■□▪\-\*\d]+\s+', text))
+        is_continuation = (not starts_bullet) and x0 >= 100 and len(normalized) > 20
+        is_caption = bool(re.match(r'^(Chapter\s+\d+|Variations|Wrist Mobility Stretches|Wrist Relief Position|What is|Introduction to)', normalized, re.IGNORECASE))
+        is_heading = (
+            (normalized.endswith(':') and len(normalized) <= 80) or
+            (len(normalized) <= 40 and normalized.isupper())
+        )
+        is_short = len(normalized) <= 32
+
+        if is_footer:
+            kind = 'footer'
+        elif is_caption:
+            kind = 'caption'
+        elif starts_bullet:
+            kind = 'list_item'
+        elif is_continuation:
+            kind = 'list_cont'
+        elif is_heading:
+            kind = 'heading'
+        elif is_short:
+            kind = 'short'
+        else:
+            kind = 'body'
+
+        return {
+            'kind': kind,
+            'indent': x0,
+            'width': width,
+            'starts_bullet': starts_bullet,
+        }
+
+    def _merge_page_blocks_for_translation(self, page_num, page_blocks, max_chars=5000, max_vertical_gap=24):
+        """把同页相邻文本块合并成更大的翻译区域，减少含图页的翻译单元数量。"""
+        if not page_blocks:
+            return []
+
+        merged = []
+        current = None
+
+        for block in page_blocks:
+            if current is None:
+                current = dict(block)
+                current['merge_meta'] = self._classify_block_for_merge(current)
+                continue
+
+            current_rect = current['rect']
+            block_rect = block['rect']
+            gap = block_rect.y0 - current_rect.y1
+            current_meta = current.get('merge_meta', self._classify_block_for_merge(current))
+            block_meta = self._classify_block_for_merge(block)
+            same_column = abs(block_rect.x0 - current_rect.x0) <= 12 and abs(block_rect.x1 - current_rect.x1) <= 24
+            list_same_column = abs(block_rect.x0 - current_rect.x0) <= 24 or block_rect.x0 >= current_rect.x0 + 8
+            merged_len = len(current['text']) + len(block['text'])
+            compatible_kind = current_meta['kind'] == 'body' and block_meta['kind'] == 'body'
+            compatible_list = (
+                current_meta['kind'] in ('list_item', 'list_cont') and
+                block_meta['kind'] == 'list_cont' and
+                block_rect.x0 >= current_rect.x0 + 8
+            )
+            similar_width = abs(current_meta['width'] - block_meta['width']) <= 60
+
+            should_merge = (
+                compatible_kind and same_column and similar_width
+            ) or (
+                compatible_list and list_same_column
+            )
+
+            if should_merge and gap <= max_vertical_gap and merged_len <= max_chars:
+                joiner = "\n\n" if gap > 10 else "\n"
+                current['text'] = f"{current['text'].rstrip()}{joiner}{block['text'].lstrip()}"
+                current['rect'] = fitz.Rect(
+                    min(current_rect.x0, block_rect.x0),
+                    min(current_rect.y0, block_rect.y0),
+                    max(current_rect.x1, block_rect.x1),
+                    max(current_rect.y1, block_rect.y1)
+                )
+                current['merge_meta'] = current_meta if compatible_kind else {
+                    **current_meta,
+                    'kind': 'list_item'
+                }
+            else:
+                current.pop('merge_meta', None)
+                merged.append(current)
+                current = dict(block)
+                current['merge_meta'] = block_meta
+
+        if current is not None:
+            current.pop('merge_meta', None)
+            merged.append(current)
+
+        for idx, block in enumerate(merged):
+            block['page_num'] = page_num
+            block['block_idx'] = idx
+
+        return merged
 
     def analyze_pdf(self, input_path):
         """分析PDF文件，返回页数、字数、语言等信息"""
@@ -188,7 +676,7 @@ class PDFTranslator:
 
         return text
 
-    def _protect_formatting(self, text):
+    def _protect_formatting(self, text, use_glossary=True):
         """保护特殊格式字符，用占位符替换，翻译后再恢复"""
         if not text:
             return text, {}
@@ -246,6 +734,19 @@ class PDFTranslator:
         for pattern in trademark_patterns:
             text = re.sub(pattern, replace_trademarks, text)
 
+        # 处理术语库，避免高频专业术语被翻译
+        if use_glossary:
+            for term in self.glossary_terms:
+                escaped_term = re.escape(term)
+                placeholder = f'__TERM_{idx}__'
+                replaced_text, count = re.subn(escaped_term, placeholder, text, count=1, flags=re.IGNORECASE)
+                while count:
+                    placeholders[placeholder] = term
+                    idx += 1
+                    text = replaced_text
+                    placeholder = f'__TERM_{idx}__'
+                    replaced_text, count = re.subn(escaped_term, placeholder, text, count=1, flags=re.IGNORECASE)
+
         return text, placeholders
 
     def _restore_formatting(self, text, placeholders):
@@ -254,7 +755,12 @@ class PDFTranslator:
             return text
 
         for placeholder, original in placeholders.items():
-            text = text.replace(placeholder, original)
+            restored = original
+            if placeholder.startswith('__BULLET_'):
+                restored = '-'
+            elif placeholder.startswith('__TERM_') and ' ' in original:
+                restored = original.replace(' ', '\u00a0')
+            text = text.replace(placeholder, restored)
 
         return text
 
@@ -316,6 +822,10 @@ class PDFTranslator:
         """使用Google Translate翻译（通过deep-translator库）"""
         if not text or not text.strip():
             return text
+
+        special_text = self._translate_special_text(text, target_lang)
+        if special_text is not None:
+            return special_text
 
         # 语言代码映射 (deep-translator使用的代码)
         lang_mapping = {
@@ -576,7 +1086,14 @@ class PDFTranslator:
             }
 
             target_lang_name = lang_names.get(target_lang, target_lang)
-            prompt = f"请将以下文本翻译成{target_lang_name}，只返回翻译结果：\n\n{text}"
+            prompt = (
+                f"把下面文本翻译成{target_lang_name}。\n"
+                "严格要求：\n"
+                "1. 只返回译文，不要解释、注释、括号说明或前后缀。\n"
+                "2. 保留项目符号、URL、数字、章节号和专有名词格式。\n"
+                "3. 如果原文已经是目标语言或不需要翻译，原样返回。\n\n"
+                f"{text}"
+            )
 
             # 记录输入token
             input_tokens = self._estimate_tokens(text)
@@ -589,10 +1106,10 @@ class PDFTranslator:
             data = {
                 "model": "deepseek/deepseek-chat",
                 "messages": [
-                    {"role": "system", "content": "你是一个专业的翻译助手。"},
+                    {"role": "system", "content": "你是严格的翻译引擎，只输出译文本身。禁止添加解释、备注、示例、总结或引号。"},
                     {"role": "user", "content": prompt}
                 ],
-                "temperature": 0.3
+                "temperature": 0
             }
 
             response = self._session.post(url, headers=headers, json=data, timeout=60)
@@ -600,6 +1117,31 @@ class PDFTranslator:
 
             if 'choices' in result and len(result['choices']) > 0:
                 translated = result['choices'][0]['message']['content'].strip()
+                translated = self._normalize_translated_text(translated)
+
+                if self._should_retry_translation(text, translated, target_lang):
+                    retry_prompt = (
+                        f"把下面英文完整翻译成{target_lang_name}。\n"
+                        "严格要求：\n"
+                        "1. 除 URL、页码、专有名词外，不得保留整句英文。\n"
+                        "2. 只返回译文，不要解释。\n"
+                        "3. 保留项目符号和原有换行。\n\n"
+                        f"{text}"
+                    )
+                    retry_data = {
+                        "model": "deepseek/deepseek-chat",
+                        "messages": [
+                            {"role": "system", "content": "你是严格的翻译引擎，必须输出完整中文译文。"},
+                            {"role": "user", "content": retry_prompt}
+                        ],
+                        "temperature": 0
+                    }
+                    retry_response = self._session.post(url, headers=headers, json=retry_data, timeout=60)
+                    retry_result = retry_response.json()
+                    if 'choices' in retry_result and retry_result['choices']:
+                        translated = self._normalize_translated_text(
+                            retry_result['choices'][0]['message']['content'].strip()
+                        )
 
                 # 记录输出token
                 output_tokens = self._estimate_tokens(translated)
@@ -622,6 +1164,83 @@ class PDFTranslator:
                 self._add_log(f'OpenRouter翻译错误: {error_msg}', 'error')
 
             return text
+
+    def _translate_text_openrouter_batch(self, texts, source_lang='auto', target_lang='en'):
+        """使用 OpenRouter 批量翻译短文本块，要求返回稳定的 XML 结构。"""
+        if not texts:
+            return []
+
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json; charset=utf-8",
+            "HTTP-Referer": "https://pdf-translator.local",
+        }
+
+        lang_names = {
+            'en': '英语',
+            'zh': '中文',
+            'ja': '日语',
+            'ko': '韩语',
+            'fr': '法语',
+            'de': '德语',
+            'es': '西班牙语',
+            'ru': '俄语',
+            'ar': '阿拉伯语'
+        }
+
+        target_lang_name = lang_names.get(target_lang, target_lang)
+        items = []
+        for idx, text in enumerate(texts):
+            safe_text = html.escape(text, quote=False)
+            items.append(f'<item id="{idx}">{safe_text}</item>')
+        payload = "\n".join(items)
+
+        prompt = (
+            f"把下面 XML 中每个 item 的内容分别翻译成{target_lang_name}。\n"
+            "严格要求：\n"
+            "1. 只返回 XML，不要解释。\n"
+            "2. 保留 item 标签和原有 id，不要增删、合并、重排。\n"
+            "3. 只翻译每个 item 标签内部的文本内容。\n"
+            "4. 保留项目符号、URL、数字、章节号和专有名词格式。\n"
+            "5. 如果某段本就不需要翻译，原样保留。\n\n"
+            f"{payload}"
+        )
+
+        data = {
+            "model": "deepseek/deepseek-chat",
+            "messages": [
+                {"role": "system", "content": "你是严格的 XML 翻译引擎。必须返回合法 XML，保持 item id 不变，只输出 XML。"},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0
+        }
+
+        response = self._session.post(url, headers=headers, json=data, timeout=90)
+        result = response.json()
+        if 'choices' not in result or not result['choices']:
+            raise Exception(f"API Error: {result}")
+
+        content = result['choices'][0]['message']['content'].strip()
+        matches = re.findall(r'<item\s+id="(\d+)">(.*?)</item>', content, flags=re.DOTALL)
+        if len(matches) != len(texts):
+            raise ValueError(f"批量返回项数不匹配: expected={len(texts)}, actual={len(matches)}")
+
+        translated = [None] * len(texts)
+        for raw_idx, raw_text in matches:
+            idx = int(raw_idx)
+            if idx < 0 or idx >= len(texts):
+                raise ValueError(f"批量返回 id 越界: {idx}")
+            translated[idx] = self._normalize_translated_text(html.unescape(raw_text.strip()))
+
+        if any(item is None for item in translated):
+            raise ValueError("批量返回缺少部分 item")
+
+        for idx, translated_text in enumerate(translated):
+            if self._should_retry_translation(texts[idx], translated_text, target_lang):
+                raise ValueError(f"批量返回存在未翻译项: {idx}")
+
+        return translated
 
     def _translate_text_kimi(self, text, source_lang='auto', target_lang='en'):
         """使用OpenRouter的Kimi (moonshot-v1-auto) API翻译"""
@@ -775,6 +1394,10 @@ class PDFTranslator:
 
     def _translate_text(self, text, source_lang='auto', target_lang='en'):
         """根据API类型选择翻译方法"""
+        special_text = self._translate_special_text(text, target_lang)
+        if special_text is not None:
+            return special_text
+
         if self.api_type == 'google':
             return self._translate_text_google(text, source_lang, target_lang)
         elif self.api_type == 'deepseek':
@@ -957,99 +1580,259 @@ class PDFTranslator:
             # 使用用户设置的并发数
             self._add_log(f'📖 开始提取和翻译（并发数: {concurrency}）...', 'info')
             self._add_log(f'⚡ 使用 {concurrency} 个线程并发翻译', 'success')
+            use_fast_extraction = self._should_use_fast_block_extraction(total_pages, file_size_mb)
+            extraction_mode = 'blocks' if use_fast_extraction else 'dict/spans'
+            self._add_log(f'文本提取模式: {extraction_mode}', 'info')
 
             # 存储每页的翻译结果: {page_num: [(rect, translated_text, font_info), ...]}
             page_translations_map = {}
+            text_page_results = {}
+            page_has_images = {}
+            text_only_pages = []
+            extraction_start_time = time.time()
+            raw_image_page_blocks = 0
 
-            # 收集所有需要翻译的文本块，并保存字体信息
-            # 使用 span 级别提取以保留项目符号等特殊格式
+            # 收集需要保真翻译的含图页文本块，以及纯文字页整页文本
             all_blocks = []
             for page_num in range(total_pages):
                 try:
                     page = doc[page_num]
-                    # 使用 dict 模式获取详细的字体信息
-                    text_dict = page.get_text("dict")
+                    image_count = len(page.get_images())
+                    page_has_images[page_num] = image_count > 0
 
-                    block_idx = 0
-                    for block in text_dict['blocks']:
-                        if block['type'] != 0:
+                    if not page_has_images[page_num]:
+                        page_text = self._clean_text(page.get_text("text"))
+                        if page_text and page_text.strip() and self._is_translatable(page_text):
+                            text_only_pages.append({
+                                'page_num': page_num,
+                                'text': page_text
+                            })
                             continue
 
-                        # 按 span 分组提取文本和格式信息
-                        spans_data = []
-                        block_text = ""
-                        for line in block['lines']:
-                            for span in line['spans']:
-                                text = span['text']
-                                block_text += text
-                                spans_data.append({
-                                    'text': text,
-                                    'font': span['font'],
-                                    'size': span['size'],
-                                    'flags': span['flags'],
-                                    'color': span['color']
-                                })
+                    if use_fast_extraction:
+                        blocks = page.get_text("blocks")
+                        blocks.sort(key=lambda b: (b[1], b[0]))
+                        page_blocks = []
 
-                        if not block_text or not block_text.strip() or not self._is_translatable(block_text):
-                            continue
+                        for block_idx, block in enumerate(blocks):
+                            if block[6] != 0:
+                                continue
 
-                        try:
-                            rect = fitz.Rect(block['bbox'])
-                        except Exception as rect_err:
-                            print(f'[WARN] 第{page_num+1}页块{block_idx}坐标异常: {rect_err}')
-                            continue
+                            text = self._normalize_extracted_block_text(block[4])
+                            if not text or not text.strip() or not self._is_translatable(text):
+                                continue
 
-                        # 获取该块的主要字体信息（取第一个 span 的字体作为代表）
-                        first_span = spans_data[0] if spans_data else None
+                            try:
+                                rect = fitz.Rect(block[0], block[1], block[2], block[3])
+                            except Exception as rect_err:
+                                print(f'[WARN] 第{page_num+1}页块{block_idx}坐标异常: {rect_err}')
+                                continue
 
-                        font_info = {
-                            'font': first_span['font'] if first_span else 'helv',
-                            'size': first_span['size'] if first_span else 11,
-                            'flags': first_span['flags'] if first_span else 0,
-                            'color': first_span['color'] if first_span else 0,
-                            'spans': spans_data
-                        }
+                            page_blocks.append({
+                                'page_num': page_num,
+                                'block_idx': block_idx,
+                                'text': text,
+                                'rect': rect,
+                                'font_info': {}
+                            })
 
-                        all_blocks.append({
-                            'page_num': page_num,
-                            'block_idx': block_idx,
-                            'text': block_text,
-                            'rect': rect,
-                            'font_info': font_info
-                        })
-                        block_idx += 1
+                        raw_image_page_blocks += len(page_blocks)
+                        is_toc_page = self._is_toc_like_page(page_blocks)
+                        if is_toc_page:
+                            merged_page_blocks = page_blocks
+                        else:
+                            merged_page_blocks = self._merge_page_blocks_for_translation(page_num, page_blocks)
+                        for merged_block in merged_page_blocks:
+                            if is_toc_page:
+                                merged_block['font_info']['layout_hint'] = 'toc'
+                            else:
+                                merged_block['font_info']['layout_hint'] = self._classify_block_for_merge(merged_block)['kind']
+                            merged_block['seq'] = len(all_blocks)
+                            all_blocks.append(merged_block)
+                    else:
+                        # 小文件保留 span 级字体信息，提升写回质量。
+                        text_dict = page.get_text("dict")
+
+                        block_idx = 0
+                        for block in text_dict['blocks']:
+                            if block['type'] != 0:
+                                continue
+
+                            spans_data = []
+                            block_text = ""
+                            for line in block['lines']:
+                                for span in line['spans']:
+                                    text = self._normalize_extracted_block_text(span['text'])
+                                    block_text += text
+                                    spans_data.append({
+                                        'text': text,
+                                        'font': span['font'],
+                                        'size': span['size'],
+                                        'flags': span['flags'],
+                                        'color': span['color']
+                                    })
+
+                            if not block_text or not block_text.strip() or not self._is_translatable(block_text):
+                                continue
+
+                            try:
+                                rect = fitz.Rect(block['bbox'])
+                            except Exception as rect_err:
+                                print(f'[WARN] 第{page_num+1}页块{block_idx}坐标异常: {rect_err}')
+                                continue
+
+                            first_span = spans_data[0] if spans_data else None
+                            font_info = {
+                                'font': first_span['font'] if first_span else 'helv',
+                                'size': first_span['size'] if first_span else 11,
+                                'flags': first_span['flags'] if first_span else 0,
+                                'color': first_span['color'] if first_span else 0,
+                                'spans': spans_data
+                            }
+
+                            all_blocks.append({
+                                'page_num': page_num,
+                                'block_idx': block_idx,
+                                'seq': len(all_blocks),
+                                'text': block_text,
+                                'rect': rect,
+                                'font_info': font_info
+                            })
+                            block_idx += 1
                 except Exception as page_err:
                     self._add_log(f'第{page_num+1}页文本提取失败（已跳过）: {page_err}', 'error')
                     continue
 
+            extraction_elapsed = time.time() - extraction_start_time
             total_blocks = len(all_blocks)
-            self._add_log(f'总共提取到 {total_blocks} 个文本块', 'info')
+            total_text_pages = len(text_only_pages)
+            total_translation_units = total_blocks + total_text_pages
+            self._add_log(f'纯文字页: {total_text_pages} 页，含图/保真页文本块: {total_blocks} 个', 'info')
+            if raw_image_page_blocks:
+                self._add_log(f'含图页块合并: {raw_image_page_blocks} -> {total_blocks}', 'info')
+            self._add_log(f'文本提取完成 (耗时: {extraction_elapsed:.1f}秒)', 'info')
 
             # 并发翻译所有文本块
             self._add_log('=' * 60, 'info')
-            self._add_log('开始翻译...', 'info')
+            self._add_log('开始调用翻译API...', 'info')
 
-            # 将短文本块合并成批次，减少 API 调用次数
-            # max_group_chars=4000：LLM 单次可处理更多文本；short_threshold=500：更多块参与合并
-            groups = self._group_short_blocks(all_blocks, max_group_chars=4000, short_threshold=500)
-            batch_count = sum(1 for t, _ in groups if t == 'batch' and len(_) > 1)
-            single_count = len(groups) - batch_count
-            self._add_log(f'文本块分组完成：{single_count} 个单独翻译，{batch_count} 个批次合并翻译', 'info')
-
-            results = {}
             completed_count = [0]
             lock = threading.Lock()
-            BATCH_SEPARATOR = "\n---SPLIT---\n"
+            text_page_runs = self._build_text_page_runs(text_only_pages, max_chars=12000)
+            self._add_log(f'纯文字页合并为 {len(text_page_runs)} 个跨页翻译批次', 'info')
 
             def _calc_remaining(elapsed, done, total):
                 if done <= 0:
                     return 0
                 return (elapsed / done) * (total - done)
 
+            def translate_text_page_run(run):
+                page_separator = "\n__PAGE_BREAK__\n"
+                page_numbers = [item['page_num'] + 1 for item in run]
+                combined = page_separator.join(item['text'] for item in run)
+                api_start_time = time.time()
+
+                self._check_cancelled()
+
+                if self.api_type == 'google':
+                    translated_combined = self._translate_text_google(combined, source_lang, target_lang)
+                else:
+                    translated_combined = self._translate_text(combined, source_lang, target_lang)
+
+                parts = translated_combined.split(page_separator)
+                if len(parts) != len(run):
+                    parts = []
+                    for item in run:
+                        text = item['text']
+                        if self.api_type == 'google':
+                            translated = self._translate_text_google(text, source_lang, target_lang)
+                        else:
+                            translated = self._translate_text(text, source_lang, target_lang)
+                        parts.append(translated if translated else text)
+
+                api_time = time.time() - api_start_time
+
+                with lock:
+                    for idx, item in enumerate(run):
+                        page_num = item['page_num']
+                        translated_text = parts[idx] if idx < len(parts) else item['text']
+                        text_page_results[page_num] = translated_text
+                        current = completed_count[0] + 1
+                        if self._should_emit_detail_log(current, total_translation_units):
+                            self._add_log(
+                                f'[纯文字页 {page_num + 1}] 已完成整页翻译 (批次耗时: {api_time:.1f}s)',
+                                'success'
+                            )
+                        completed_count[0] += 1
+
+                    elapsed_time = time.time() - translation_start_time
+                    current = completed_count[0]
+                    est_remaining = _calc_remaining(elapsed_time, current, total_translation_units)
+                    if self._should_emit_progress_update(current, total_translation_units):
+                        self._update_progress(
+                            current,
+                            total_translation_units,
+                            f'已翻译 {current}/{total_translation_units} 个单元...',
+                            elapsed_time=elapsed_time,
+                            estimated_remaining=est_remaining
+                        )
+
+                self._add_log(
+                    f'纯文字页批次完成: 第 {page_numbers[0]} 页到第 {page_numbers[-1]} 页',
+                    'info'
+                )
+
+            if self.api_type == 'google':
+                groups = self._group_short_blocks(all_blocks, max_group_chars=4000, short_threshold=500)
+                batch_count = sum(1 for t, _ in groups if t == 'batch' and len(_) > 1)
+                single_count = len(groups) - batch_count
+                self._add_log(f'文本块分组完成：{single_count} 个单独翻译，{batch_count} 个批次合并翻译', 'info')
+            elif self.api_type == 'openrouter':
+                groups = self._group_short_blocks(all_blocks, max_group_chars=1800, short_threshold=220)
+                batch_count = sum(1 for t, blocks in groups if t == 'batch' and len(blocks) > 1)
+                single_count = len(groups) - batch_count
+                self._add_log(
+                    f'文本块分组完成：{single_count} 个单独翻译，{batch_count} 个 OpenRouter 结构化批次',
+                    'info'
+                )
+            else:
+                groups = [('single', [block]) for block in all_blocks]
+                self._add_log(
+                    f'文本块分组完成：{len(groups)} 个独立翻译单元（LLM 模式禁用二次批次，避免分隔符丢失回退）',
+                    'info'
+                )
+
+            results = {}
+            BATCH_SEPARATOR = "\n---SPLIT---\n"
+
             def translate_unit(unit):
                 """翻译一个工作单元（单块或批次短文本块）"""
                 group_type, blocks = unit
                 api_start_time = time.time()
+
+                if len(blocks) == 1 and blocks[0].get('font_info', {}).get('layout_hint', 'body') != 'body':
+                    block_info = blocks[0]
+                    text = self._clean_text(block_info['text'])
+                    translated = self._strict_translate_text(text, source_lang, target_lang)
+                    translated = self._normalize_translated_text(translated)
+                    with lock:
+                        current_num = block_info.get('seq', 0) + 1
+                        if self._should_emit_detail_log(current_num, total_blocks):
+                            display_original = text[:200] + '...' if len(text) > 200 else text
+                            display_translated = translated[:200] + '...' if len(translated) > 200 else translated
+                            self._add_log(f'[原文 {current_num}/{total_blocks}] {display_original}', 'info')
+                            self._add_log(f'[译文 {current_num}/{total_blocks}] {display_translated} (严格翻译)', 'success')
+                        completed_count[0] += 1
+                        elapsed_time = time.time() - translation_start_time
+                        current = completed_count[0]
+                        est_remaining = _calc_remaining(elapsed_time, current, total_translation_units)
+                        if self._should_emit_progress_update(current, total_translation_units):
+                            self._update_progress(
+                                current, total_translation_units,
+                                f'已翻译 {current}/{total_translation_units} 个单元...',
+                                elapsed_time=elapsed_time, estimated_remaining=est_remaining
+                            )
+                    return [(block_info, translated)]
 
                 # ---- 批次翻译（多个短文本块合并为一次 API 调用） ----
                 if group_type == 'batch' and len(blocks) > 1:
@@ -1058,10 +1841,11 @@ class PDFTranslator:
 
                     # 先记录所有原文日志
                     with lock:
-                        base_num = completed_count[0]
                         for i, text in enumerate(texts):
-                            display = text[:200] + '...' if len(text) > 200 else text
-                            self._add_log(f'[原文 {base_num + i + 1}/{total_blocks}] {display}', 'info')
+                            current_num = blocks[i].get('seq', 0) + 1
+                            if self._should_emit_detail_log(current_num, total_blocks):
+                                display = text[:200] + '...' if len(text) > 200 else text
+                                self._add_log(f'[原文 {current_num}/{total_blocks}] {display}', 'info')
 
                     try:
                         self._check_cancelled()
@@ -1071,14 +1855,20 @@ class PDFTranslator:
                             combined_translated = GoogleTranslator(
                                 source=normalized_source, target=normalized_target
                             ).translate(combined)
+                        elif self.api_type == 'openrouter':
+                            parts = self._translate_text_openrouter_batch(texts, source_lang, target_lang)
+                            combined_translated = None
                         else:
                             combined_translated = self._translate_text(combined, source_lang, target_lang)
 
                         api_time = time.time() - api_start_time
-                        output_tokens = self._estimate_tokens(combined_translated)
+                        output_tokens = self._estimate_tokens(combined_translated) if combined_translated is not None else sum(
+                            self._estimate_tokens(part) for part in parts
+                        )
 
                         # 拆分结果；如数量不匹配则逐一翻译（不回退原文）
-                        parts = combined_translated.split(BATCH_SEPARATOR)
+                        if self.api_type != 'openrouter':
+                            parts = combined_translated.split(BATCH_SEPARATOR)
                         if len(parts) != len(blocks):
                             print(f'[WARN] 批次拆分不匹配: 期望 {len(blocks)}, 实际 {len(parts)}，逐一翻译回退')
                             parts = []
@@ -1094,14 +1884,23 @@ class PDFTranslator:
                                 except Exception:
                                     parts.append(t)
 
-                        with lock:
-                            base_num = completed_count[0]
-                            for i, (block, translated) in enumerate(zip(blocks, parts)):
-                                display = translated[:200] + '...' if len(translated) > 200 else translated
-                                self._add_log(
-                                    f'[译文 {base_num + i + 1}/{total_blocks}] {display} (耗时: {api_time:.1f}s)',
-                                    'success'
+                        final_parts = []
+                        for i, translated in enumerate(parts):
+                            final_parts.append(
+                                self._ensure_target_translation(
+                                    texts[i], translated, source_lang, target_lang
                                 )
+                            )
+
+                        with lock:
+                            for i, (block, translated) in enumerate(zip(blocks, final_parts)):
+                                current_num = block.get('seq', 0) + 1
+                                if self._should_emit_detail_log(current_num, total_blocks):
+                                    display = translated[:200] + '...' if len(translated) > 200 else translated
+                                    self._add_log(
+                                        f'[译文 {current_num}/{total_blocks}] {display} (耗时: {api_time:.1f}s)',
+                                        'success'
+                                    )
                                 cache_key = (texts[i], source_lang, target_lang)
                                 self._translation_cache[cache_key] = translated
 
@@ -1111,28 +1910,36 @@ class PDFTranslator:
 
                             elapsed_time = time.time() - translation_start_time
                             current = completed_count[0]
-                            est_remaining = _calc_remaining(elapsed_time, current, total_blocks)
-                            self._update_progress(
-                                current, total_blocks,
-                                f'已翻译 {current}/{total_blocks} 个文本块...',
-                                elapsed_time=elapsed_time, estimated_remaining=est_remaining
-                            )
+                            est_remaining = _calc_remaining(elapsed_time, current, total_translation_units)
+                            if self._should_emit_progress_update(current, total_translation_units):
+                                self._update_progress(
+                                    current, total_translation_units,
+                                    f'已翻译 {current}/{total_translation_units} 个单元...',
+                                    elapsed_time=elapsed_time, estimated_remaining=est_remaining
+                                )
 
-                        return [(b, t) for b, t in zip(blocks, parts)]
+                        return [(b, t) for b, t in zip(blocks, final_parts)]
 
                     except Exception as e:
                         print(f'批次翻译失败: {e}')
+                        fallback_parts = []
+                        for text in texts:
+                            try:
+                                fallback_parts.append(self._strict_translate_text(text, source_lang, target_lang))
+                            except Exception as strict_err:
+                                self._add_log(f'批次块严格重翻失败，保留原文: {str(strict_err)[:120]}', 'error')
+                                fallback_parts.append(text)
                         with lock:
                             completed_count[0] += len(blocks)
                             elapsed_time = time.time() - translation_start_time
                             current = completed_count[0]
-                            est_remaining = _calc_remaining(elapsed_time, current, total_blocks)
+                            est_remaining = _calc_remaining(elapsed_time, current, total_translation_units)
                             self._update_progress(
-                                current, total_blocks,
-                                f'已翻译 {current}/{total_blocks} 个文本块...',
+                                current, total_translation_units,
+                                f'已翻译 {current}/{total_translation_units} 个单元...',
                                 elapsed_time=elapsed_time, estimated_remaining=est_remaining
                             )
-                        return [(b, b['text']) for b in blocks]
+                        return [(b, t) for b, t in zip(blocks, fallback_parts)]
 
                 # ---- 单块翻译 ----
                 block_info = blocks[0]
@@ -1148,26 +1955,29 @@ class PDFTranslator:
                         if cache_key in self._translation_cache:
                             translated = self._translation_cache[cache_key]
                             with lock:
-                                current_num = completed_count[0] + 1
-                                display_orig = text[:200] + '...' if len(text) > 200 else text
-                                display_trans = translated[:200] + '...' if len(translated) > 200 else translated
-                                self._add_log(f'[原文 {current_num}/{total_blocks}] {display_orig}', 'info')
-                                self._add_log(f'[译文 {current_num}/{total_blocks}] {display_trans} (缓存命中)', 'success')
+                                current_num = block_info.get('seq', 0) + 1
+                                if self._should_emit_detail_log(current_num, total_blocks):
+                                    display_orig = text[:200] + '...' if len(text) > 200 else text
+                                    display_trans = translated[:200] + '...' if len(translated) > 200 else translated
+                                    self._add_log(f'[原文 {current_num}/{total_blocks}] {display_orig}', 'info')
+                                    self._add_log(f'[译文 {current_num}/{total_blocks}] {display_trans} (缓存命中)', 'success')
                                 completed_count[0] += 1
                                 elapsed_time = time.time() - translation_start_time
                                 current = completed_count[0]
-                                est_remaining = _calc_remaining(elapsed_time, current, total_blocks)
-                                self._update_progress(
-                                    current, total_blocks,
-                                    f'已翻译 {current}/{total_blocks} 个文本块...',
-                                    elapsed_time=elapsed_time, estimated_remaining=est_remaining
-                                )
+                                est_remaining = _calc_remaining(elapsed_time, current, total_translation_units)
+                                if self._should_emit_progress_update(current, total_translation_units):
+                                    self._update_progress(
+                                        current, total_translation_units,
+                                        f'已翻译 {current}/{total_translation_units} 个单元...',
+                                        elapsed_time=elapsed_time, estimated_remaining=est_remaining
+                                    )
                             return [(block_info, translated)]
 
                         with lock:
-                            current_num = completed_count[0] + 1
-                            display_original = text[:200] + '...' if len(text) > 200 else text
-                            self._add_log(f'[原文 {current_num}/{total_blocks}] {display_original}', 'info')
+                            current_num = block_info.get('seq', 0) + 1
+                            if self._should_emit_detail_log(current_num, total_blocks):
+                                display_original = text[:200] + '...' if len(text) > 200 else text
+                                self._add_log(f'[原文 {current_num}/{total_blocks}] {display_original}', 'info')
 
                         input_tokens = self._estimate_tokens(text)
 
@@ -1177,16 +1987,20 @@ class PDFTranslator:
                             ).translate(text)
                         else:
                             translated = self._translate_text(text, source_lang, target_lang)
+                        translated = self._ensure_target_translation(
+                            text, translated, source_lang, target_lang
+                        )
 
                         output_tokens = self._estimate_tokens(translated)
                         api_time = time.time() - api_start_time
 
                         with lock:
-                            display_translated = translated[:200] + '...' if len(translated) > 200 else translated
-                            self._add_log(
-                                f'[译文 {current_num}/{total_blocks}] {display_translated} (耗时: {api_time:.1f}s)',
-                                'success'
-                            )
+                            if self._should_emit_detail_log(current_num, total_blocks):
+                                display_translated = translated[:200] + '...' if len(translated) > 200 else translated
+                                self._add_log(
+                                    f'[译文 {current_num}/{total_blocks}] {display_translated} (耗时: {api_time:.1f}s)',
+                                    'success'
+                                )
                             self.input_tokens += input_tokens
                             self.output_tokens += output_tokens
                             self._translation_cache[cache_key] = translated
@@ -1194,45 +2008,65 @@ class PDFTranslator:
 
                             elapsed_time = time.time() - translation_start_time
                             current = completed_count[0]
-                            est_remaining = _calc_remaining(elapsed_time, current, total_blocks)
-                            self._update_progress(
-                                current, total_blocks,
-                                f'已翻译 {current}/{total_blocks} 个文本块...',
-                                elapsed_time=elapsed_time, estimated_remaining=est_remaining
-                            )
+                            est_remaining = _calc_remaining(elapsed_time, current, total_translation_units)
+                            if self._should_emit_progress_update(current, total_translation_units):
+                                self._update_progress(
+                                    current, total_translation_units,
+                                    f'已翻译 {current}/{total_translation_units} 个单元...',
+                                    elapsed_time=elapsed_time, estimated_remaining=est_remaining
+                                )
 
                         return [(block_info, translated)]
 
                     except Exception as e:
                         print(f'Translation error for block {block_info["block_idx"]} (attempt {attempt + 1}): {e}')
                         if attempt == max_retries - 1:
+                            try:
+                                strict_translated = self._strict_translate_text(text, source_lang, target_lang)
+                                return [(block_info, strict_translated)]
+                            except Exception as strict_err:
+                                self._add_log(
+                                    f'第{block_info["page_num"] + 1}页块{block_info["block_idx"] + 1}严格重翻失败，保留原文: {str(strict_err)[:120]}',
+                                    'error'
+                                )
                             with lock:
                                 completed_count[0] += 1
                                 elapsed_time = time.time() - translation_start_time
                                 current = completed_count[0]
-                                est_remaining = _calc_remaining(elapsed_time, current, total_blocks)
-                                self._update_progress(
-                                    current, total_blocks,
-                                    f'已翻译 {current}/{total_blocks} 个文本块...',
-                                    elapsed_time=elapsed_time, estimated_remaining=est_remaining
-                                )
+                                est_remaining = _calc_remaining(elapsed_time, current, total_translation_units)
+                                if self._should_emit_progress_update(current, total_translation_units):
+                                    self._update_progress(
+                                        current, total_translation_units,
+                                        f'已翻译 {current}/{total_translation_units} 个单元...',
+                                        elapsed_time=elapsed_time, estimated_remaining=est_remaining
+                                    )
                             return [(block_info, block_info['text'])]
                         else:
                             time.sleep(0.5 * (2 ** attempt))  # 指数退避
 
-            # 使用用户设置的并发数翻译（以 group 为并发单元）
-            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = {executor.submit(translate_unit, group): group for group in groups}
+            if text_page_runs:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(concurrency, max(1, len(text_page_runs)))) as executor:
+                    futures = [executor.submit(translate_text_page_run, run) for run in text_page_runs]
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            future.result()
+                        except Exception as e:
+                            print(f'Text-page future error: {e}')
 
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        block_results = future.result()
-                        for block_info, translated_text in block_results:
-                            results[(block_info['page_num'], block_info['block_idx'])] = (
-                                block_info['rect'], translated_text
-                            )
-                    except Exception as e:
-                        print(f'Future error: {e}')
+            # 使用用户设置的并发数翻译（以 group 为并发单元）
+            if groups:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    futures = {executor.submit(translate_unit, group): group for group in groups}
+
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            block_results = future.result()
+                            for block_info, translated_text in block_results:
+                                results[(block_info['page_num'], block_info['block_idx'])] = (
+                                    block_info['rect'], translated_text
+                                )
+                        except Exception as e:
+                            print(f'Future error: {e}')
 
             self._add_log(f'✓ 所有文本块翻译完成', 'success')
             print(f'[DEBUG] results字典包含 {len(results)} 个翻译结果')
@@ -1244,6 +2078,15 @@ class PDFTranslator:
 
             for page_num in range(total_pages):
                 page_translations = []
+
+                if page_num in text_page_results:
+                    page_translations_map[page_num] = text_page_results[page_num]
+                    if page_num < 3 or page_num >= total_pages - 3:
+                        preview = text_page_results[page_num][:200]
+                        if len(text_page_results[page_num]) > 200:
+                            preview += '...'
+                        self._add_log(f'[页{page_num + 1}|整页文本] 译文: {preview}', 'success')
+                    continue
 
                 # 获取这一页的所有文本块
                 page_blocks = [b for b in all_blocks if b['page_num'] == page_num]
@@ -1272,11 +2115,17 @@ class PDFTranslator:
                     else:
                         self._add_log(f'⚠️ 第{page_num + 1}页块{block_idx + 1}翻译结果丢失', 'error')
 
-                page_translations_map[page_num] = page_translations
+                toc_like_count = sum(1 for _, _, font_info in page_translations if font_info.get('layout_hint') == 'toc')
+                if page_translations and toc_like_count >= max(5, int(len(page_translations) * 0.6)):
+                    joined_page_text = "\n".join(text for _, text, _ in page_translations if text and text.strip())
+                    page_translations_map[page_num] = joined_page_text
+                else:
+                    page_translations_map[page_num] = page_translations
 
                 # 记录跳过的页面
                 if page_num >= 3 and page_num < total_pages - 3:
-                    self._add_log(f'--- 第 {page_num + 1} 页（已跳过，{len(page_translations)} 个文本块） ---', 'info')
+                    detail = '整页文本' if isinstance(page_translations_map[page_num], str) else f'{len(page_translations)} 个文本块'
+                    self._add_log(f'--- 第 {page_num + 1} 页（已跳过，{detail}） ---', 'info')
 
             self._add_log(f'✓ 所有页面翻译完成', 'success')
 
@@ -1311,8 +2160,74 @@ class PDFTranslator:
                     if rotation and rotation in (90, 180, 270):
                         new_page.set_rotation(rotation)
                     new_page.draw_rect(new_page.rect, color=(1, 1, 1), fill=(1, 1, 1))
+                    page_registered_fonts = self._register_page_fonts(new_page)
                 except Exception as page_setup_err:
                     self._add_log(f'第{page_num+1}页初始化失败（已跳过）: {page_setup_err}', 'error')
+                    continue
+
+                if isinstance(page_translations, str):
+                    translated_page_text = self._normalize_translated_text(page_translations)
+                    image_top_band = 0
+                    try:
+                        image_top_band = max(
+                            (rect.y1 for img in page.get_images() for rect in page.get_image_rects(img[0]) if rect.y0 <= 5),
+                            default=0
+                        )
+                    except Exception:
+                        image_top_band = 0
+                    margin = 36
+                    top_margin = max(margin, image_top_band + 20)
+                    text_rect = fitz.Rect(
+                        margin,
+                        top_margin,
+                        new_page.rect.width - margin,
+                        new_page.rect.height - margin
+                    )
+                    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', translated_page_text))
+                    total_chars = len(translated_page_text)
+                    is_chinese = chinese_chars > total_chars * 0.3 if total_chars > 0 else False
+                    font_candidates = self._build_font_candidates(
+                        page_registered_fonts, translated_page_text, 'helv', False, False, is_chinese
+                    )
+                    font_sizes = [11, 10, 9, 8, 7, 6]
+                    written = False
+
+                    for font_name in font_candidates:
+                        for fontsize in font_sizes:
+                            try:
+                                result = new_page.insert_textbox(
+                                    text_rect,
+                                    translated_page_text,
+                                    fontsize=fontsize,
+                                    fontname=font_name,
+                                    color=(0, 0, 0),
+                                    align=0
+                                )
+                                if result >= 0:
+                                    written = True
+                                    break
+                            except Exception:
+                                break
+                        if written:
+                            break
+
+                    if written:
+                        total_written += 1
+                        if page_num < 3 or page_num >= total_pages - 3:
+                            self._add_log(f'第 {page_num + 1} 页完成: 整页文本写入成功', 'success')
+                    else:
+                        self._add_log(f'⚠️ 第{page_num + 1}页整页文本写入失败', 'error')
+
+                    elapsed_time = time.time() - translation_start_time
+                    done_pages = page_num + 1
+                    est_remaining = _calc_remaining(elapsed_time, done_pages, total_pages)
+                    self._update_progress(
+                        done_pages,
+                        total_pages,
+                        f'已写入 {done_pages}/{total_pages} 页',
+                        elapsed_time=elapsed_time,
+                        estimated_remaining=est_remaining
+                    )
                     continue
 
                 # 复制原页面的所有图片
@@ -1340,15 +2255,25 @@ class PDFTranslator:
                 # 更新这一页的内容
                 success_count = 0
                 page_bottom = new_page.rect.height - 5
+                image_rects = []
+                try:
+                    for img in page.get_images():
+                        for rect in page.get_image_rects(img[0]):
+                            image_rects.append(rect)
+                except Exception:
+                    image_rects = []
+                image_top_band = max((rect.y1 for rect in image_rects if rect.y0 <= 5), default=0)
 
                 for idx, (text_rect, translated_text, font_info) in enumerate(page_translations):
                     try:
                         written = False
+                        translated_text = self._normalize_translated_text(translated_text)
 
                         # 获取原始字体信息
                         original_font = font_info.get('font', 'helv')
                         original_size = font_info.get('size', 11)
                         original_flags = font_info.get('flags', 0)
+                        layout_hint = font_info.get('layout_hint', 'body')
 
                         # 判断是否为粗体
                         is_bold = (original_flags & 16) != 0
@@ -1360,38 +2285,26 @@ class PDFTranslator:
                         is_chinese = chinese_chars > total_chars * 0.3 if total_chars > 0 else False
 
                         # 根据翻译后文本语言选择字体
-                        if is_chinese:
-                            # 中文翻译：使用中文字体
-                            if is_bold:
-                                font_names = ['china-s', 'china-ss', 'china-t']
-                            else:
-                                font_names = ['china-s', 'china-t', 'china-ss']
-                        else:
-                            # 英文或其他语言：保留原始字体或使用通用英文字体
-                            # PyMuPDF 支持的内置字体
-                            if original_font and 'Times' in original_font:
-                                font_names = ['times-roman', 'times-italic', 'times-bold', 'helv']
-                            elif original_font and 'Helv' in original_font:
-                                font_names = ['helv', 'helv-bold', 'times-roman']
-                            elif original_font and 'Courier' in original_font:
-                                font_names = ['courier', 'courier-bold', 'helv']
-                            else:
-                                # 通用英文字体，根据粗体/斜体选择
-                                if is_bold and is_italic:
-                                    font_names = ['helv-bolditalic', 'helv-bold', 'helv']
-                                elif is_bold:
-                                    font_names = ['helv-bold', 'helv', 'times-bold']
-                                elif is_italic:
-                                    font_names = ['helv-italic', 'helv', 'times-italic']
-                                else:
-                                    font_names = ['helv', 'times-roman', 'courier']
+                        font_names = self._build_font_candidates(
+                            page_registered_fonts, translated_text, original_font, is_bold, is_italic, is_chinese
+                        )
+                        if layout_hint == 'toc':
+                            toc_fonts = [name for name in ('ui_unicode', 'ui_cjk', 'ui_heiti', 'helv') if name in font_names or name in page_registered_fonts]
+                            font_names = toc_fonts + [name for name in font_names if name not in toc_fonts]
 
                         # 使用原始字体大小（中文适当缩小）
                         if is_chinese:
                             base_fontsize = max(6, original_size * 0.85)
                         else:
                             base_fontsize = max(6, original_size * 0.95)
+                        if layout_hint == 'toc':
+                            base_fontsize = max(6, base_fontsize * 0.85)
                         font_sizes = [base_fontsize, base_fontsize * 0.85, base_fontsize * 0.7, 6]
+                        text_color = (1, 1, 1) if text_rect.y0 < image_top_band else (0, 0, 0)
+                        next_top = None
+                        if idx + 1 < len(page_translations):
+                            next_top = page_translations[idx + 1][0].y0
+                        max_expand_bottom = page_bottom if next_top is None else max(text_rect.y1, next_top - 4)
 
                         for font_name in font_names:
                             # 逐步缩小字体尝试放入原矩形
@@ -1402,7 +2315,7 @@ class PDFTranslator:
                                         translated_text,
                                         fontsize=fontsize,
                                         fontname=font_name,
-                                        color=(0, 0, 0),
+                                        color=text_color,
                                         align=0
                                     )
                                     if result >= 0:
@@ -1418,14 +2331,14 @@ class PDFTranslator:
                                 try:
                                     extended_rect = fitz.Rect(
                                         text_rect.x0, text_rect.y0,
-                                        text_rect.x1, max(text_rect.y1, page_bottom)
+                                        text_rect.x1, min(max_expand_bottom, page_bottom)
                                     )
                                     result = new_page.insert_textbox(
                                         extended_rect,
                                         translated_text,
                                         fontsize=6,
                                         fontname=font_name,
-                                        color=(0, 0, 0),
+                                        color=text_color,
                                         align=0
                                     )
                                     if result >= 0:
@@ -1445,7 +2358,7 @@ class PDFTranslator:
                                     translated_text,
                                     fontsize=6,
                                     fontname="helv",
-                                    color=(0, 0, 0)
+                                    color=text_color
                                 )
                                 success_count += 1
                                 total_written += 1
@@ -1587,6 +2500,7 @@ class PDFTranslator:
 
         # 并发翻译
         translation_start_time = time.time()
+        total_chunks = len(text_chunks)
         completed_count = [0]
         lock = threading.Lock()
         results = {}
@@ -1615,13 +2529,12 @@ class PDFTranslator:
                 # 记录输出token
                 output_tokens = self._estimate_tokens(translated)
 
-                # 显示当前翻译内容（包含原文和译文）
-                display_text = text[:100] + '...' if len(text) > 100 else text
-                display_translated = translated[:100] + '...' if len(translated) > 100 else translated
-                # 发送原文日志
-                self._add_log(f'[原文 {chunk_idx + 1}/{len(text_chunks)}] {display_text}', 'info')
-                # 发送译文日志
-                self._add_log(f'[译文 {chunk_idx + 1}/{len(text_chunks)}] {display_translated} (耗时: {api_time:.1f}s)', 'success')
+                current_num = chunk_idx + 1
+                if self._should_emit_detail_log(current_num, total_chunks):
+                    display_text = text[:100] + '...' if len(text) > 100 else text
+                    display_translated = translated[:100] + '...' if len(translated) > 100 else translated
+                    self._add_log(f'[原文 {current_num}/{total_chunks}] {display_text}', 'info')
+                    self._add_log(f'[译文 {current_num}/{total_chunks}] {display_translated} (耗时: {api_time:.1f}s)', 'success')
 
                 with lock:
                     self.input_tokens += input_tokens
@@ -1631,15 +2544,15 @@ class PDFTranslator:
                     # 更新进度
                     elapsed_time = time.time() - translation_start_time
                     current = completed_count[0]
-                    total_chunks = len(text_chunks)
                     est_remaining = (elapsed_time / current) * (total_chunks - current) if current > 0 else 0
-                    self._update_progress(
-                        current,
-                        total_chunks,
-                        f'已翻译 {current}/{total_chunks} 个文本块...',
-                        elapsed_time=elapsed_time,
-                        estimated_remaining=est_remaining
-                    )
+                    if self._should_emit_progress_update(current, total_chunks):
+                        self._update_progress(
+                            current,
+                            total_chunks,
+                            f'已翻译 {current}/{total_chunks} 个文本块...',
+                            elapsed_time=elapsed_time,
+                            estimated_remaining=est_remaining
+                        )
 
                     # 记录翻译结果
                     results[chunk_idx] = translated
