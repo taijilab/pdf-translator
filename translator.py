@@ -441,7 +441,9 @@ class PDFTranslator:
         text = re.sub(r'\s+\)', ')', text)
         text = re.sub(r'\(\s+', '(', text)
         text = re.sub(r'\n?注释[:：]\n?(?:\d+\.\s*.*(?:\n|$)){1,6}', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'\n?说明[:：]\n?(?:[-•\d].*(?:\n|$)){1,6}', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'\n?说明[:：]\n?(?:[-•\d].*(?:\n|$)){1,8}', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'(?s)[（(]说明[:：].*$', '', text)
+        text = re.sub(r'(?s)说明[:：].*$', '', text)
         text = re.sub(r'[\(（]保留原排版.*?[\)）]', '', text)
         text = re.sub(r'(?m)^(?:注[:：]|输出[:：]?|翻译[:：]?|完全符合要求.*|严格遵循要求.*|章节编号.*|括号使用.*|空行结构.*)$', '', text)
         text = re.sub(r'(?m)^\d+\.\s*(?:严格遵循要求.*|确保未出现.*|数字.*|空行结构.*|完全符合.*)$', '', text)
@@ -601,6 +603,7 @@ class PDFTranslator:
 
         is_footer = self._is_page_footer_text(text)
         starts_bullet = bool(re.match(r'^[•●◆◾▪◦■□▪\-\*\d]+\s+', text))
+        bullet_heading = starts_bullet and normalized.endswith(':') and len(normalized) <= 80
         is_continuation = (not starts_bullet) and x0 >= 100 and len(normalized) > 20
         is_caption = bool(re.match(r'^(Chapter\s+\d+|Variations|Wrist Mobility Stretches|Wrist Relief Position|What is|Introduction to)', normalized, re.IGNORECASE))
         is_heading = (
@@ -613,6 +616,8 @@ class PDFTranslator:
             kind = 'footer'
         elif is_caption:
             kind = 'caption'
+        elif bullet_heading:
+            kind = 'heading'
         elif starts_bullet:
             kind = 'list_item'
         elif is_continuation:
@@ -2232,12 +2237,7 @@ class PDFTranslator:
                     else:
                         self._add_log(f'⚠️ 第{page_num + 1}页块{block_idx + 1}翻译结果丢失', 'error')
 
-                toc_like_count = sum(1 for _, _, font_info in page_translations if font_info.get('layout_hint') == 'toc')
-                if page_translations and toc_like_count >= max(5, int(len(page_translations) * 0.6)):
-                    joined_page_text = "\n".join(text for _, text, _ in page_translations if text and text.strip())
-                    page_translations_map[page_num] = joined_page_text
-                else:
-                    page_translations_map[page_num] = page_translations
+                page_translations_map[page_num] = page_translations
 
                 # 记录跳过的页面
                 if page_num >= 3 and page_num < total_pages - 3:
@@ -2459,6 +2459,28 @@ class PDFTranslator:
                             )
 
                         for font_name in font_names:
+                            single_line_heading = (
+                                layout_hint in ('caption', 'heading', 'short')
+                                and '\n' not in translated_text
+                                and len(translated_text) <= 48
+                            )
+                            if single_line_heading:
+                                for fontsize in font_sizes[:-1]:
+                                    try:
+                                        new_page.insert_text(
+                                            (text_rect.x0, text_rect.y0 + fontsize),
+                                            translated_text,
+                                            fontsize=fontsize,
+                                            fontname=font_name,
+                                            color=text_color,
+                                        )
+                                        written = True
+                                        break
+                                    except Exception:
+                                        continue
+                                if written:
+                                    break
+
                             rect_variants = [text_rect]
                             if expanded_rect != text_rect:
                                 rect_variants.append(expanded_rect)
