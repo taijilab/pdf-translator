@@ -244,6 +244,30 @@ def export_glossary_payload(filename=None):
     return payload
 
 
+def list_file_glossaries():
+    if not os.path.isdir(GLOSSARY_DIR):
+        return []
+
+    items = []
+    for name in sorted(os.listdir(GLOSSARY_DIR)):
+        path = os.path.join(GLOSSARY_DIR, name)
+        if not os.path.isfile(path) or not name.endswith('.json'):
+            continue
+        if os.path.dirname(path) == PRESET_GLOSSARY_DIR:
+            continue
+        if name == os.path.basename(GLOSSARY_PATH):
+            continue
+        terms = _read_terms_file(path)
+        stat = os.stat(path)
+        items.append({
+            'file_key': name[:-5],
+            'path': path,
+            'term_count': len(terms),
+            'updated_at': int(stat.st_mtime),
+        })
+    return items
+
+
 def extract_glossary_candidates(text, existing_terms=None, limit=15):
     existing_terms = {term.lower() for term in (existing_terms or [])}
     pattern = re.compile(
@@ -345,6 +369,7 @@ def analyze():
         analysis['glossary_scope'] = glossary_state['scope']
         analysis['glossary_source_label'] = glossary_state['source_label']
         analysis['glossary_file_key'] = glossary_state['file_key']
+        analysis['glossary_source_path'] = glossary_state['source_path']
         analysis['suggested_terms'] = extract_glossary_candidates(doc, glossary_terms)
 
         # 删除临时文件
@@ -766,6 +791,11 @@ def delete_file_glossary():
         os.remove(path)
     glossary_state = load_scoped_glossary(filename)
     return jsonify({'status': 'ok', **glossary_state, 'deleted_file_key': key})
+
+
+@app.route('/glossary/list')
+def glossary_list():
+    return jsonify({'items': list_file_glossaries()})
 
 
 @app.route('/glossary/export')

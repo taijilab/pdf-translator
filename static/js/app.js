@@ -34,6 +34,8 @@ const saveGlobalGlossaryBtn = document.getElementById('saveGlobalGlossaryBtn');
 const glossarySourceEl = document.getElementById('glossarySource');
 const glossaryKeyEl = document.getElementById('glossaryKey');
 const glossaryPathEl = document.getElementById('glossaryPath');
+const glossaryLibraryList = document.getElementById('glossaryLibraryList');
+const refreshGlossaryListBtn = document.getElementById('refreshGlossaryListBtn');
 const versionBadge = document.getElementById('versionBadge');
 const buildBadge = document.getElementById('buildBadge');
 let currentTaskId = null;
@@ -71,6 +73,73 @@ function setGlossaryKey(fileKey) {
 function setGlossaryPath(path) {
     if (glossaryPathEl) {
         glossaryPathEl.textContent = `来源文件：${path || '-'}`;
+    }
+}
+
+function formatTimestamp(ts) {
+    if (!ts) return '-';
+    return new Date(ts * 1000).toLocaleString();
+}
+
+function renderGlossaryLibrary(items) {
+    if (!glossaryLibraryList) return;
+    glossaryLibraryList.innerHTML = '';
+
+    if (!items || items.length === 0) {
+        glossaryLibraryList.innerHTML = '<div class="glossary-library-empty">暂无文件术语库</div>';
+        return;
+    }
+
+    items.forEach(item => {
+        const row = document.createElement('div');
+        row.className = 'glossary-library-item';
+        row.innerHTML = `
+            <div class="glossary-library-meta">
+                <div class="glossary-library-key">${item.file_key}</div>
+                <div class="glossary-library-sub">${item.term_count} 个术语 · ${formatTimestamp(item.updated_at)}</div>
+            </div>
+            <div class="glossary-library-actions">
+                <button type="button" class="btn-secondary glossary-load-btn">加载</button>
+                <button type="button" class="btn-secondary glossary-delete-btn">删除</button>
+            </div>
+        `;
+        row.querySelector('.glossary-load-btn').addEventListener('click', async () => {
+            currentGlossaryFilename = `${item.file_key}.pdf`;
+            await loadGlossary(currentGlossaryFilename);
+            showMessage(`已加载术语库：${item.file_key}`, 'success');
+        });
+        row.querySelector('.glossary-delete-btn').addEventListener('click', async () => {
+            try {
+                const response = await fetch(`/glossary/file?filename=${encodeURIComponent(item.file_key + '.pdf')}`, {
+                    method: 'DELETE'
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || '删除文件术语库失败');
+                }
+                if (currentGlossaryFilename === `${item.file_key}.pdf`) {
+                    setGlossaryTerms(data.terms || []);
+                    setGlossarySource(data.source_label);
+                    setGlossaryKey(data.file_key);
+                    setGlossaryPath(data.source_path);
+                }
+                await refreshGlossaryLibrary();
+                showMessage(`已删除术语库：${item.file_key}`, 'success');
+            } catch (error) {
+                showMessage(error.message || '删除文件术语库失败', 'error');
+            }
+        });
+        glossaryLibraryList.appendChild(row);
+    });
+}
+
+async function refreshGlossaryLibrary() {
+    try {
+        const response = await fetch('/glossary/list');
+        const data = await response.json();
+        renderGlossaryLibrary(data.items || []);
+    } catch (error) {
+        console.error('Failed to load glossary library:', error);
     }
 }
 
@@ -165,6 +234,7 @@ async function saveGlossaryWithScope(saveScope = 'file') {
         setGlossarySource(data.source_label);
         setGlossaryKey(data.file_key);
         setGlossaryPath(data.source_path);
+        await refreshGlossaryLibrary();
         showMessage(saveScope === 'global' ? '已另存为全局术语库' : '术语库已保存', 'success');
     } catch (error) {
         showMessage(error.message || '保存术语库失败', 'error');
@@ -214,6 +284,7 @@ async function deleteFileGlossary() {
         setGlossaryKey(data.file_key);
         setGlossaryPath(data.source_path);
         showMessage(`已删除文件术语库：${data.deleted_file_key}`, 'success');
+        await refreshGlossaryLibrary();
     } catch (error) {
         showMessage(error.message || '删除文件术语库失败', 'error');
     }
@@ -287,6 +358,7 @@ concurrencyInput.addEventListener('input', () => {
 document.addEventListener('DOMContentLoaded', () => {
     restoreSettings();
     loadGlossary();
+    refreshGlossaryLibrary();
     refreshVersionBadge();
 
     // 绑定拷贝日志按钮
@@ -305,6 +377,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (deleteGlossaryBtn) {
         deleteGlossaryBtn.addEventListener('click', deleteFileGlossary);
+    }
+    if (refreshGlossaryListBtn) {
+        refreshGlossaryListBtn.addEventListener('click', refreshGlossaryLibrary);
     }
     if (importGlossaryBtn && importGlossaryInput) {
         importGlossaryBtn.addEventListener('click', () => importGlossaryInput.click());
@@ -576,6 +651,8 @@ async function handleFile(file) {
                 setGlossaryTerms(merged);
             }
             setGlossarySource(data.glossary_source_label);
+            setGlossaryKey(data.glossary_file_key);
+            setGlossaryPath(data.glossary_source_path);
             renderGlossarySuggestions(data.suggested_terms || []);
 
             // 根据检测到的语言自动设置源语言

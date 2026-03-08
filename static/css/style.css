@@ -97,6 +97,68 @@ header h1 {
     word-break: break-all;
 }
 
+.glossary-library {
+    margin-top: 14px;
+    border-top: 1px solid #e6eaf5;
+    padding-top: 12px;
+}
+
+.glossary-library-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+    color: #4f5b7a;
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.glossary-library-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.glossary-library-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid #e6eaf5;
+    border-radius: 10px;
+    background: #fafbff;
+}
+
+.glossary-library-meta {
+    min-width: 0;
+}
+
+.glossary-library-key {
+    color: #2f3852;
+    font-size: 13px;
+    font-weight: 700;
+    word-break: break-all;
+}
+
+.glossary-library-sub {
+    color: #7a849b;
+    font-size: 12px;
+}
+
+.glossary-library-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.glossary-library-empty {
+    color: #8a93a8;
+    font-size: 12px;
+    padding: 8px 0;
+}
+
 /* 输出格式选择 */
 .output-format-section {
     margin-bottom: 20px;
