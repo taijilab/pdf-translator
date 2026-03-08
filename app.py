@@ -227,6 +227,17 @@ def save_scoped_glossary(terms, filename=None):
     }
 
 
+def export_glossary_payload(filename=None):
+    glossary_state = load_scoped_glossary(filename)
+    payload = {
+        'terms': glossary_state['terms'],
+        'scope': glossary_state['scope'],
+        'source_label': glossary_state['source_label'],
+        'file_key': glossary_state['file_key'],
+    }
+    return payload
+
+
 def extract_glossary_candidates(text, existing_terms=None, limit=15):
     existing_terms = {term.lower() for term in (existing_terms or [])}
     pattern = re.compile(
@@ -724,8 +735,27 @@ def glossary():
     data = request.get_json(silent=True) or {}
     terms = data.get('terms', [])
     filename = (data.get('filename') or '').strip()
-    saved = save_scoped_glossary(terms, filename or None)
+    save_scope = (data.get('save_scope') or 'file').strip().lower()
+    if save_scope == 'global':
+        saved = {
+            'terms': save_glossary(terms),
+            'scope': 'global',
+            'source_label': '全局术语库',
+            'file_key': None,
+        }
+    else:
+        saved = save_scoped_glossary(terms, filename or None)
     return jsonify({'status': 'ok', **saved})
+
+
+@app.route('/glossary/export')
+def export_glossary():
+    filename = request.args.get('filename', '').strip()
+    payload = export_glossary_payload(filename or None)
+    export_name = payload['file_key'] or 'global'
+    response = jsonify(payload)
+    response.headers['Content-Disposition'] = f'attachment; filename="{export_name}.glossary.json"'
+    return response
 
 if __name__ == '__main__':
     # 本地运行：python app.py

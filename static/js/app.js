@@ -28,7 +28,10 @@ const glossarySuggestions = document.getElementById('glossarySuggestions');
 const saveGlossaryBtn = document.getElementById('saveGlossaryBtn');
 const importGlossaryBtn = document.getElementById('importGlossaryBtn');
 const importGlossaryInput = document.getElementById('importGlossaryInput');
+const exportGlossaryBtn = document.getElementById('exportGlossaryBtn');
+const saveGlobalGlossaryBtn = document.getElementById('saveGlobalGlossaryBtn');
 const glossarySourceEl = document.getElementById('glossarySource');
+const glossaryKeyEl = document.getElementById('glossaryKey');
 const versionBadge = document.getElementById('versionBadge');
 const buildBadge = document.getElementById('buildBadge');
 let currentTaskId = null;
@@ -54,6 +57,12 @@ function setGlossaryTerms(terms) {
 function setGlossarySource(label) {
     if (glossarySourceEl) {
         glossarySourceEl.textContent = `当前术语库：${label || '全局术语库'}`;
+    }
+}
+
+function setGlossaryKey(fileKey) {
+    if (glossaryKeyEl) {
+        glossaryKeyEl.textContent = `文件Key：${fileKey || '未选择文件'}`;
     }
 }
 
@@ -101,6 +110,7 @@ async function loadGlossary(filename = '') {
         const data = await response.json();
         setGlossaryTerms(data.terms || []);
         setGlossarySource(data.source_label);
+        setGlossaryKey(data.file_key);
     } catch (error) {
         console.error('Failed to load glossary:', error);
     }
@@ -125,6 +135,10 @@ async function refreshVersionBadge() {
 }
 
 async function saveGlossary() {
+    return saveGlossaryWithScope('file');
+}
+
+async function saveGlossaryWithScope(saveScope = 'file') {
     try {
         const terms = parseGlossaryTerms(glossaryTermsInput.value);
         const response = await fetch('/glossary', {
@@ -132,7 +146,7 @@ async function saveGlossary() {
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ terms, filename: currentGlossaryFilename })
+            body: JSON.stringify({ terms, filename: currentGlossaryFilename, save_scope: saveScope })
         });
         const data = await response.json();
         if (!response.ok) {
@@ -140,9 +154,35 @@ async function saveGlossary() {
         }
         setGlossaryTerms(data.terms || []);
         setGlossarySource(data.source_label);
-        showMessage('术语库已保存', 'success');
+        setGlossaryKey(data.file_key);
+        showMessage(saveScope === 'global' ? '已另存为全局术语库' : '术语库已保存', 'success');
     } catch (error) {
         showMessage(error.message || '保存术语库失败', 'error');
+    }
+}
+
+async function exportGlossary() {
+    try {
+        const query = currentGlossaryFilename ? `?filename=${encodeURIComponent(currentGlossaryFilename)}` : '';
+        const response = await fetch(`/glossary/export${query}`);
+        if (!response.ok) {
+            throw new Error('导出术语库失败');
+        }
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const key = glossaryKeyEl ? glossaryKeyEl.textContent.replace('文件Key：', '').trim() : 'glossary';
+        a.href = url;
+        a.download = `${key === '未选择文件' ? 'global' : key}.glossary.json`;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+        }, 100);
+        showMessage('术语库已导出', 'success');
+    } catch (error) {
+        showMessage(error.message || '导出术语库失败', 'error');
     }
 }
 
@@ -223,6 +263,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (saveGlossaryBtn) {
         saveGlossaryBtn.addEventListener('click', saveGlossary);
+    }
+    if (saveGlobalGlossaryBtn) {
+        saveGlobalGlossaryBtn.addEventListener('click', () => saveGlossaryWithScope('global'));
+    }
+    if (exportGlossaryBtn) {
+        exportGlossaryBtn.addEventListener('click', exportGlossary);
     }
     if (importGlossaryBtn && importGlossaryInput) {
         importGlossaryBtn.addEventListener('click', () => importGlossaryInput.click());
