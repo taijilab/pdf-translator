@@ -650,7 +650,11 @@ class PDFTranslator:
             gap = block_rect.y0 - current_rect.y1
             current_meta = current.get('merge_meta', self._classify_block_for_merge(current))
             block_meta = self._classify_block_for_merge(block)
-            same_column = abs(block_rect.x0 - current_rect.x0) <= 12 and abs(block_rect.x1 - current_rect.x1) <= 24
+            same_left = abs(block_rect.x0 - current_rect.x0) <= 14
+            overlap_width = min(block_rect.x1, current_rect.x1) - max(block_rect.x0, current_rect.x0)
+            min_width = max(1, min(block_rect.width, current_rect.width))
+            horizontal_overlap_ratio = overlap_width / min_width if overlap_width > 0 else 0
+            same_column = same_left and (abs(block_rect.x1 - current_rect.x1) <= 48 or horizontal_overlap_ratio >= 0.75)
             list_same_column = abs(block_rect.x0 - current_rect.x0) <= 24 or block_rect.x0 >= current_rect.x0 + 8
             merged_len = len(current['text']) + len(block['text'])
             compatible_kind = current_meta['kind'] == 'body' and block_meta['kind'] == 'body'
@@ -659,10 +663,8 @@ class PDFTranslator:
                 block_meta['kind'] == 'list_cont' and
                 block_rect.x0 >= current_rect.x0 + 8
             )
-            similar_width = abs(current_meta['width'] - block_meta['width']) <= 60
-
             should_merge = (
-                compatible_kind and same_column and similar_width
+                compatible_kind and same_column
             ) or (
                 compatible_list and list_same_column
             )
@@ -2408,15 +2410,15 @@ class PDFTranslator:
                             toc_fonts = [name for name in ('ui_unicode', 'ui_cjk', 'ui_heiti', 'helv') if name in font_names or name in page_registered_fonts]
                             font_names = toc_fonts + [name for name in font_names if name not in toc_fonts]
                         elif layout_hint in ('caption', 'heading', 'short'):
-                            heading_fonts = [name for name in ('ui_unicode', 'ui_heiti', 'ui_cjk', 'helv') if name in font_names or name in page_registered_fonts]
+                            heading_fonts = [name for name in ('ui_heiti', 'ui_unicode', 'ui_cjk', 'helv-bold', 'helv') if name in font_names or name in page_registered_fonts]
                             font_names = heading_fonts + [name for name in font_names if name not in heading_fonts]
 
                         # 标题、图注和短标签优先保留原始字号，正文再适度缩小。
                         if layout_hint in ('caption', 'heading', 'short'):
                             if is_chinese:
-                                base_fontsize = max(7, original_size * 0.98)
+                                base_fontsize = max(10, original_size * 1.02)
                             else:
-                                base_fontsize = max(7, original_size)
+                                base_fontsize = max(10, original_size)
                         elif layout_hint in ('list_item', 'list_cont'):
                             if is_chinese:
                                 base_fontsize = max(7, original_size * 0.95)
@@ -2428,7 +2430,7 @@ class PDFTranslator:
                             base_fontsize = max(6, original_size * 0.95)
                         if layout_hint == 'toc':
                             base_fontsize = max(6, base_fontsize * 0.85)
-                        font_sizes = [base_fontsize, base_fontsize * 0.92, base_fontsize * 0.84, base_fontsize * 0.76, 6]
+                        font_sizes = [base_fontsize, base_fontsize * 0.95, base_fontsize * 0.9, base_fontsize * 0.84, 6]
                         original_color = font_info.get('color', 0)
                         if self._looks_light_color(original_color):
                             text_color = self._pdf_color_to_rgb(original_color)
