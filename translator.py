@@ -212,11 +212,16 @@ class PDFTranslator:
         normalized = "\n".join(line.strip() for line in text.splitlines() if line.strip())
         patterns = [
             r'严格遵循',
+            r'严格遵照',
             r'处理原则',
             r'处理方式',
             r'符合以下',
             r'未添加额外说明',
             r'完全符合要求',
+            r'交办要求',
+            r'解释性说明',
+            r'全数转换为',
+            r'不保留任何英文',
             r'章节编号采用',
             r'括号使用',
             r'保留原排版',
@@ -2460,18 +2465,22 @@ class PDFTranslator:
 
                         for font_name in font_names:
                             single_line_heading = (
-                                layout_hint in ('caption', 'heading', 'short')
+                                layout_hint in ('caption', 'heading', 'short', 'toc')
                                 and '\n' not in translated_text
-                                and len(translated_text) <= 48
+                                and len(translated_text) <= 80
                             )
                             if single_line_heading:
                                 for fontsize in font_sizes[:-1]:
                                     try:
+                                        if layout_hint in ('caption', 'heading', 'short') or (layout_hint == 'toc' and len(translated_text) <= 32):
+                                            draw_font = 'ui_unicode' if 'ui_unicode' in page_registered_fonts else font_name
+                                        else:
+                                            draw_font = font_name
                                         new_page.insert_text(
                                             (text_rect.x0, text_rect.y0 + fontsize),
                                             translated_text,
                                             fontsize=fontsize,
-                                            fontname=font_name,
+                                            fontname=draw_font,
                                             color=text_color,
                                         )
                                         written = True

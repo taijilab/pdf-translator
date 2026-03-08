@@ -402,6 +402,7 @@ dropArea.addEventListener('drop', (e) => {
 // 处理文件
 async function handleFile(file) {
     if (file) {
+        resetProgressStats();
         fileInfo.textContent = `已选择: ${file.name} (${formatFileSize(file.size)})`;
 
         // 分析文件
@@ -537,6 +538,17 @@ function updateProgress(data) {
     if (data.estimated_cost !== undefined) {
         estimatedCostEl.textContent = '$' + data.estimated_cost.toFixed(4);
     }
+}
+
+function resetProgressStats() {
+    progressFill.style.width = '0%';
+    progressPercentage.textContent = '0%';
+    progressText.textContent = '等待处理中...';
+    elapsedTimeEl.textContent = '0秒';
+    remainingTimeEl.textContent = '计算中...';
+    inputTokensEl.textContent = '0';
+    outputTokensEl.textContent = '0';
+    estimatedCostEl.textContent = '$0.0000';
 }
 
 // 格式化时间
