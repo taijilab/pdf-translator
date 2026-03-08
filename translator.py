@@ -83,6 +83,12 @@ class PDFTranslator:
         normalized.sort(key=len, reverse=True)
         return normalized
 
+    def _is_url_only_text(self, text):
+        if not text:
+            return False
+        normalized = " ".join(text.split())
+        return bool(re.fullmatch(r'(https?://[^\s]+|www\.[^\s]+)', normalized))
+
     def _is_translatable(self, text):
         """判断文本块是否需要翻译；跳过纯数字/符号/极短文本，节省 API 调用"""
         stripped = text.strip()
@@ -1919,7 +1925,10 @@ class PDFTranslator:
                 if len(blocks) == 1 and blocks[0].get('font_info', {}).get('layout_hint', 'body') != 'body':
                     block_info = blocks[0]
                     text = self._clean_text(block_info['text'])
-                    translated = self._strict_translate_text(text, source_lang, target_lang)
+                    if self._is_url_only_text(text):
+                        translated = text
+                    else:
+                        translated = self._strict_translate_text(text, source_lang, target_lang)
                     translated = self._normalize_translated_text(translated)
                     with lock:
                         current_num = block_info.get('seq', 0) + 1
@@ -2408,6 +2417,11 @@ class PDFTranslator:
                                 base_fontsize = max(7, original_size * 0.98)
                             else:
                                 base_fontsize = max(7, original_size)
+                        elif layout_hint in ('list_item', 'list_cont'):
+                            if is_chinese:
+                                base_fontsize = max(7, original_size * 0.95)
+                            else:
+                                base_fontsize = max(7, original_size * 0.98)
                         elif is_chinese:
                             base_fontsize = max(6, original_size * 0.88)
                         else:
@@ -2426,34 +2440,50 @@ class PDFTranslator:
                         if idx + 1 < len(page_translations):
                             next_top = page_translations[idx + 1][0].y0
                         max_expand_bottom = page_bottom if next_top is None else max(text_rect.y1, next_top - 4)
+                        expanded_rect = fitz.Rect(text_rect)
+                        if layout_hint in ('caption', 'heading', 'short') and self._looks_light_color(original_color):
+                            expanded_rect = fitz.Rect(
+                                text_rect.x0,
+                                text_rect.y0,
+                                new_page.rect.width - 72,
+                                min(max_expand_bottom, max(text_rect.y1 + original_size * 1.6, text_rect.y1))
+                            )
+                        elif layout_hint in ('list_item', 'list_cont'):
+                            expanded_rect = fitz.Rect(
+                                text_rect.x0,
+                                text_rect.y0,
+                                text_rect.x1,
+                                min(max_expand_bottom, max(text_rect.y1 + original_size * 2.2, text_rect.y1))
+                            )
 
                         for font_name in font_names:
-                            # 逐步缩小字体尝试放入原矩形
-                            for fontsize in font_sizes:
-                                try:
-                                    result = new_page.insert_textbox(
-                                        text_rect,
-                                        translated_text,
-                                        fontsize=fontsize,
-                                        fontname=font_name,
-                                        color=text_color,
-                                        align=0
-                                    )
-                                    if result >= 0:
-                                        written = True
+                            rect_variants = [text_rect]
+                            if expanded_rect != text_rect:
+                                rect_variants.append(expanded_rect)
+                            for candidate_rect in rect_variants:
+                                for fontsize in font_sizes:
+                                    try:
+                                        result = new_page.insert_textbox(
+                                            candidate_rect,
+                                            translated_text,
+                                            fontsize=fontsize,
+                                            fontname=font_name,
+                                            color=text_color,
+                                            align=0
+                                        )
+                                        if result >= 0:
+                                            written = True
+                                            break
+                                    except Exception:
                                         break
-                                except Exception:
-                                    break  # 该字体不可用，换下一个
+                                if written:
+                                    break
                             if written:
                                 break
 
-                            # 原矩形装不下：扩展到页面底部再试
                             if not written:
                                 try:
-                                    extended_rect = fitz.Rect(
-                                        text_rect.x0, text_rect.y0,
-                                        text_rect.x1, min(max_expand_bottom, page_bottom)
-                                    )
+                                    extended_rect = fitz.Rect(text_rect.x0, text_rect.y0, expanded_rect.x1, min(max_expand_bottom, page_bottom))
                                     result = new_page.insert_textbox(
                                         extended_rect,
                                         translated_text,
