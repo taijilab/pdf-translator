@@ -140,7 +140,7 @@ class PDFTranslator:
 
     def _should_use_fast_block_extraction(self, total_pages, file_size_mb):
         """大文件优先使用 blocks 提取，减少 dict/span 解析开销。"""
-        return total_pages >= 30 or file_size_mb >= 8
+        return total_pages >= 45 or file_size_mb >= 12
 
     def _should_emit_detail_log(self, current, total):
         """大任务只抽样输出块级原文/译文日志，避免 SSE 和前端渲染过载。"""
@@ -1776,6 +1776,7 @@ class PDFTranslator:
                     else:
                         # 小文件保留 span 级字体信息，提升写回质量。
                         text_dict = page.get_text("dict")
+                        raw_page_blocks = []
 
                         block_idx = 0
                         for block in text_dict['blocks']:
@@ -1806,23 +1807,35 @@ class PDFTranslator:
                                 continue
 
                             first_span = spans_data[0] if spans_data else None
+                            layout_hint = self._classify_block_for_merge({
+                                'text': block_text,
+                                'rect': rect,
+                                'font_info': {}
+                            })['kind']
                             font_info = {
                                 'font': first_span['font'] if first_span else 'helv',
                                 'size': first_span['size'] if first_span else 11,
                                 'flags': first_span['flags'] if first_span else 0,
                                 'color': first_span['color'] if first_span else 0,
-                                'spans': spans_data
+                                'spans': spans_data,
+                                'layout_hint': layout_hint,
                             }
 
-                            all_blocks.append({
+                            block_entry = {
                                 'page_num': page_num,
                                 'block_idx': block_idx,
                                 'seq': len(all_blocks),
                                 'text': block_text,
                                 'rect': rect,
                                 'font_info': font_info
-                            })
+                            }
+                            raw_page_blocks.append(block_entry)
+                            all_blocks.append(block_entry)
                             block_idx += 1
+
+                        if raw_page_blocks and self._is_toc_like_page(raw_page_blocks):
+                            for block_entry in raw_page_blocks:
+                                block_entry['font_info']['layout_hint'] = 'toc'
                 except Exception as page_err:
                     self._add_log(f'第{page_num+1}页文本提取失败（已跳过）: {page_err}', 'error')
                     continue
