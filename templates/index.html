@@ -137,6 +137,49 @@
                     💡 <strong>提示</strong>: 并发数越高速度越快，但可能触发API限制。建议：Google翻译使用2-4，付费API可用4-10。
                 </p>
 
+                <div class="translation-strategy-section">
+                    <div class="translation-strategy-header">
+                        <label>Baoyu 翻译策略</label>
+                        <span class="translation-strategy-badge">适用于 AI API</span>
+                    </div>
+                    <div class="settings-row strategy-row">
+                        <div class="language-group">
+                            <label for="translationMode">翻译模式</label>
+                            <select id="translationMode" name="translation_mode">
+                                <option value="quick">Quick · 快速直译</option>
+                                <option value="normal" selected>Normal · 分析增强</option>
+                                <option value="refined">Refined · 精翻润色</option>
+                            </select>
+                        </div>
+                        <div class="language-group">
+                            <label for="translationAudience">目标读者</label>
+                            <select id="translationAudience" name="translation_audience">
+                                <option value="general" selected>普通读者</option>
+                                <option value="technical">技术读者</option>
+                                <option value="academic">学术读者</option>
+                                <option value="business">商务读者</option>
+                            </select>
+                        </div>
+                        <div class="language-group">
+                            <label for="translationStyle">译文风格</label>
+                            <select id="translationStyle" name="translation_style">
+                                <option value="storytelling" selected>storytelling</option>
+                                <option value="formal">formal</option>
+                                <option value="technical">technical</option>
+                                <option value="literal">literal</option>
+                                <option value="academic">academic</option>
+                                <option value="business">business</option>
+                                <option value="humorous">humorous</option>
+                                <option value="conversational">conversational</option>
+                                <option value="elegant">elegant</option>
+                            </select>
+                        </div>
+                    </div>
+                    <p class="translation-strategy-note">
+                        <code>normal</code> 会增强术语与语气控制，<code>refined</code> 会在初稿后追加一轮审校润色。Google Translate 会自动退回快速模式。
+                    </p>
+                </div>
+
                 <div class="glossary-section">
                     <div class="glossary-header">
                         <label for="glossaryTerms">专业术语库</label>

@@ -423,6 +423,9 @@ def translate():
     api_key = request.form.get('api_key', '')
     source_lang = request.form.get('source_lang', 'auto')
     target_lang = request.form.get('target_lang', 'en')
+    translation_mode = request.form.get('translation_mode', 'normal')
+    translation_audience = request.form.get('translation_audience', 'general')
+    translation_style = request.form.get('translation_style', 'storytelling')
     task_id = normalize_task_id(request.form.get('task_id', ''))
     concurrency = int(request.form.get('concurrency', 4))  # 获取并发数，默认4
     glossary_terms = parse_glossary_input(request.form.get('glossary_terms', '')) or load_scoped_glossary(file.filename)['terms']
@@ -483,7 +486,10 @@ def translate():
                 progress_callback=progress_callback,
                 log_callback=log_callback,
                 cancel_callback=check_cancelled,
-                glossary_terms=glossary_terms
+                glossary_terms=glossary_terms,
+                translation_mode=translation_mode,
+                audience=translation_audience,
+                style=translation_style
             )
 
             # 发送初始化日志
@@ -558,6 +564,9 @@ def translate_text():
     api_key = request.form.get('api_key', '')
     source_lang = request.form.get('source_lang', 'auto')
     target_lang = request.form.get('target_lang', 'zh')
+    translation_mode = request.form.get('translation_mode', 'normal')
+    translation_audience = request.form.get('translation_audience', 'general')
+    translation_style = request.form.get('translation_style', 'storytelling')
     task_id = normalize_task_id(request.form.get('task_id', ''))
     concurrency = int(request.form.get('concurrency', 4))
     glossary_terms = parse_glossary_input(request.form.get('glossary_terms', '')) or load_scoped_glossary(file.filename)['terms']
@@ -614,7 +623,10 @@ def translate_text():
                 progress_callback=progress_callback,
                 log_callback=log_callback,
                 cancel_callback=check_cancelled,
-                glossary_terms=glossary_terms
+                glossary_terms=glossary_terms,
+                translation_mode=translation_mode,
+                audience=translation_audience,
+                style=translation_style
             )
 
             # 发送初始化日志

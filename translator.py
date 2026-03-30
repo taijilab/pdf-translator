@@ -15,6 +15,57 @@ class PDFTranslator:
         ('ui_heiti', '/System/Library/Fonts/STHeiti Light.ttc'),
         ('ui_unicode', '/Library/Fonts/Arial Unicode.ttf'),
     ]
+    LANG_NAMES = {
+        'en': '英语',
+        'zh': '中文',
+        'ja': '日语',
+        'ko': '韩语',
+        'fr': '法语',
+        'de': '德语',
+        'es': '西班牙语',
+        'ru': '俄语',
+        'ar': '阿拉伯语',
+        'auto': '自动检测'
+    }
+    MODE_LABELS = {
+        'quick': '快速',
+        'normal': '标准',
+        'refined': '精翻'
+    }
+    AUDIENCE_PRESETS = {
+        'general': '面向普通读者，优先自然、易读、顺畅。',
+        'technical': '面向开发者和工程师，术语准确，减少不必要解释。',
+        'academic': '面向研究者和学者，语体正式，术语精确。',
+        'business': '面向商务读者，表达清晰、结果导向、便于快速理解。'
+    }
+    STYLE_PRESETS = {
+        'storytelling': '叙事流畅，衔接自然，读起来有带入感。',
+        'formal': '正式、中性、结构清晰。',
+        'technical': '精确、文档风格、简洁克制。',
+        'literal': '尽量贴近原句结构，但保持可读性。',
+        'academic': '学术化、严谨、措辞规范。',
+        'business': '商务化、简洁、重点明确。',
+        'humorous': '保留并适配原文的幽默感。',
+        'conversational': '口语化、友好、像在解释给人听。',
+        'elegant': '更讲究节奏与文采，行文精致。'
+    }
+    BAOYU_GLOSSARY_EN_ZH = {
+        'AI Agent': 'AI 智能体',
+        'Vibe Coding': '凭感觉编程',
+        'the Bitter Lesson': '苦涩的教训',
+        'Context Engineering': '上下文工程',
+        'AI Wrapper': 'AI 套壳',
+        'RLHF': '基于人类反馈的强化学习',
+        'Hallucination': '幻觉',
+        'Alignment': '对齐',
+        'Guardrails': '护栏',
+        'Agentic': '智能体化的',
+        'Grounding': '基础化/落地',
+        'Embedding': '嵌入/向量化',
+        'Moat': '护城河',
+        'Flywheel': '飞轮效应',
+        'Boilerplate': '样板代码'
+    }
 
     # API价格（每1M tokens的价格，单位：美元）
     PRICING = {
@@ -44,7 +95,18 @@ class PDFTranslator:
         }
     }
 
-    def __init__(self, api_type='google', api_key=None, progress_callback=None, log_callback=None, cancel_callback=None, glossary_terms=None):
+    def __init__(
+        self,
+        api_type='google',
+        api_key=None,
+        progress_callback=None,
+        log_callback=None,
+        cancel_callback=None,
+        glossary_terms=None,
+        translation_mode='normal',
+        audience='general',
+        style='storytelling'
+    ):
         self.api_type = api_type
         self.api_key = api_key
         self.progress_callback = progress_callback
@@ -56,6 +118,10 @@ class PDFTranslator:
         self._translation_cache = {}  # 翻译缓存：(text, src, tgt) -> translated
         self._session = requests.Session()  # 复用 HTTP 连接，减少握手开销
         self.glossary_terms = self._normalize_glossary_terms(glossary_terms or [])
+        self.translation_mode = self._normalize_translation_mode(translation_mode)
+        self.audience = self._normalize_audience(audience)
+        self.style = self._normalize_style(style)
+        self._strategy_notice_emitted = False
 
         # 只在需要时初始化translator
         if self.api_type == 'google':
@@ -82,6 +148,215 @@ class PDFTranslator:
             normalized.append(clean)
         normalized.sort(key=len, reverse=True)
         return normalized
+
+    def _normalize_translation_mode(self, mode):
+        return mode if mode in self.MODE_LABELS else 'normal'
+
+    def _normalize_audience(self, audience):
+        clean = (audience or 'general').strip()
+        return clean if clean else 'general'
+
+    def _normalize_style(self, style):
+        clean = (style or 'storytelling').strip()
+        return clean if clean else 'storytelling'
+
+    def _lang_name(self, code):
+        return self.LANG_NAMES.get(code, code or '未知语言')
+
+    def _supports_advanced_strategy(self):
+        return self.api_type in {'deepseek', 'zhipu', 'openrouter', 'kimi', 'gpt'}
+
+    def _effective_translation_mode(self):
+        if self._supports_advanced_strategy():
+            return self.translation_mode
+        return 'quick'
+
+    def _emit_strategy_notice_once(self):
+        if self._strategy_notice_emitted:
+            return
+        self._strategy_notice_emitted = True
+        if self.api_type == 'google' and self.translation_mode != 'quick':
+            self._add_log('当前选择了 Baoyu 翻译模式，但 Google Translate 仅支持快速直译；已自动按 quick 模式处理。', 'info')
+
+    def _audience_instruction(self):
+        return self.AUDIENCE_PRESETS.get(self.audience, self.audience)
+
+    def _style_instruction(self):
+        return self.STYLE_PRESETS.get(self.style, self.style)
+
+    def _matched_baoyu_glossary(self, text, target_lang):
+        if target_lang != 'zh' or not text:
+            return []
+        matches = []
+        lowered = text.lower()
+        for source_term, translated_term in self.BAOYU_GLOSSARY_EN_ZH.items():
+            if source_term.lower() in lowered:
+                matches.append((source_term, translated_term))
+        matches.sort(key=lambda item: (-len(item[0]), item[0]))
+        return matches[:8]
+
+    def _glossary_instruction(self, text, target_lang):
+        terms = self._matched_baoyu_glossary(text, target_lang)
+        if not terms:
+            return ''
+        lines = ['术语优先使用以下固定译法：']
+        for source_term, translated_term in terms:
+            lines.append(f'- {source_term} -> {translated_term}')
+        return '\n'.join(lines)
+
+    def _build_translation_prompt(self, text, source_lang, target_lang, strict=False):
+        source_lang_name = self._lang_name(source_lang)
+        target_lang_name = self._lang_name(target_lang)
+        mode = self._effective_translation_mode()
+        prompt_lines = [
+            f'把下面内容翻译成{target_lang_name}。',
+            f'源语言：{source_lang_name}。',
+            f'翻译模式：{self.MODE_LABELS.get(mode, mode)}。',
+            f'目标读者：{self._audience_instruction()}',
+            f'风格要求：{self._style_instruction()}',
+            '通用要求：',
+            '1. 准确优先，不得增删事实、逻辑、数据或结论。',
+            '2. 译文应自然流畅，像目标语言母语作者直接写成，而不是生硬直译。',
+            '3. 保留段落、项目符号、URL、数字、章节号、专有名词和必要的格式结构。',
+            '4. 不得新增原文没有的项目符号、编号列表、注释、脚注、说明、示例或总结。',
+            '5. 只返回译文本身，不要解释、不要加引号、不要加前后缀。'
+        ]
+        glossary_instruction = self._glossary_instruction(text, target_lang)
+        if glossary_instruction:
+            prompt_lines.append(glossary_instruction)
+        if strict:
+            prompt_lines.append('额外要求：除 URL、页码和明确品牌名外，不要保留整句源语言内容。')
+        prompt_lines.append(f'\n原文：\n{text}')
+        return '\n'.join(prompt_lines)
+
+    def _build_batch_translation_prompt(self, texts, source_lang, target_lang):
+        source_lang_name = self._lang_name(source_lang)
+        target_lang_name = self._lang_name(target_lang)
+        combined = '\n'.join(texts)
+        prompt_lines = [
+            f'把下面 XML 中每个 item 的文本内容翻译成{target_lang_name}。',
+            f'源语言：{source_lang_name}。',
+            f'翻译模式：{self.MODE_LABELS.get(self._effective_translation_mode(), self._effective_translation_mode())}。',
+            f'目标读者：{self._audience_instruction()}',
+            f'风格要求：{self._style_instruction()}',
+            '严格要求：',
+            '1. 只返回合法 XML，不要解释。',
+            '2. 保留 item 标签和 id，不要增删、合并、重排。',
+            '3. 只翻译每个 item 标签内部的文本内容。',
+            '4. 保留项目符号、URL、数字、章节号和专有名词格式。',
+            '5. 不得新增原文没有的项目符号、编号列表、注释、脚注或说明。'
+        ]
+        glossary_instruction = self._glossary_instruction(combined, target_lang)
+        if glossary_instruction:
+            prompt_lines.append(glossary_instruction)
+        return '\n'.join(prompt_lines)
+
+    def _extract_openrouter_batch_items(self, content, expected_count):
+        """尽量从模型返回中提取 item，允许部分成功，缺项由调用方补翻。"""
+        cleaned = (content or '').strip()
+        if cleaned.startswith('```'):
+            cleaned = re.sub(r'^```[a-zA-Z0-9_-]*\s*', '', cleaned)
+            cleaned = re.sub(r'\s*```$', '', cleaned)
+
+        matches = re.findall(r"<item\s+id=['\"](\d+)['\"]\s*>(.*?)</item>", cleaned, flags=re.DOTALL)
+        translated = [None] * expected_count
+        for raw_idx, raw_text in matches:
+            idx = int(raw_idx)
+            if 0 <= idx < expected_count and translated[idx] is None:
+                translated[idx] = self._normalize_translated_text(html.unescape(raw_text.strip()))
+        return translated
+
+    def _build_polish_prompt(self, source_text, draft_text, source_lang, target_lang):
+        target_lang_name = self._lang_name(target_lang)
+        return (
+            f'请把下面译稿润色成最终的{target_lang_name}版本。\n'
+            f'目标读者：{self._audience_instruction()}\n'
+            f'风格要求：{self._style_instruction()}\n'
+            '要求：\n'
+            '1. 对照原文修正遗漏、误译、生硬表达和欧化语序。\n'
+            '2. 不得增删事实，不得加入解释性备注。\n'
+            '3. 保留原有段落结构、项目符号、URL、数字和专有名词。\n'
+            '4. 只返回润色后的最终译文。\n\n'
+            f'原文：\n{source_text}\n\n'
+            f'当前译稿：\n{draft_text}'
+        )
+
+    def _provider_config(self, api_type=None):
+        provider = api_type or self.api_type
+        if provider == 'deepseek':
+            return {
+                'url': 'https://api.deepseek.com/v1/chat/completions',
+                'headers': {
+                    'Authorization': f'Bearer {self.api_key}',
+                    'Content-Type': 'application/json; charset=utf-8'
+                },
+                'model': 'deepseek-chat',
+                'timeout': 60
+            }
+        if provider == 'zhipu':
+            return {
+                'url': 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+                'headers': {
+                    'Authorization': f'Bearer {self.api_key}',
+                    'Content-Type': 'application/json; charset=utf-8'
+                },
+                'model': 'GLM-4-Flash',
+                'timeout': 60
+            }
+        if provider in {'openrouter', 'kimi', 'gpt'}:
+            model = {
+                'openrouter': 'deepseek/deepseek-chat',
+                'kimi': 'moonshot/moonshot-v1-auto',
+                'gpt': 'openai/gpt-4-turbo'
+            }[provider]
+            return {
+                'url': 'https://openrouter.ai/api/v1/chat/completions',
+                'headers': {
+                    'Authorization': f'Bearer {self.api_key}',
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'HTTP-Referer': 'https://pdf-translator.local'
+                },
+                'model': model,
+                'timeout': 120 if provider in {'kimi', 'gpt'} else 90
+            }
+        raise ValueError(f'Unsupported provider for chat completion: {provider}')
+
+    def _chat_completion(self, messages, api_type=None, temperature=0.1, timeout=None):
+        config = self._provider_config(api_type)
+        data = {
+            'model': config['model'],
+            'messages': messages,
+            'temperature': temperature
+        }
+        response = self._session.post(
+            config['url'],
+            headers=config['headers'],
+            json=data,
+            timeout=timeout or config['timeout']
+        )
+        result = response.json()
+        if 'choices' in result and result['choices']:
+            return result['choices'][0]['message']['content'].strip()
+        raise Exception(f"API Error: {result}")
+
+    def _maybe_polish_translation(self, source_text, translated_text, source_lang, target_lang):
+        if self._effective_translation_mode() != 'refined' or not self._supports_advanced_strategy():
+            return translated_text
+        if not source_text or not translated_text:
+            return translated_text
+        try:
+            polished = self._chat_completion(
+                [
+                    {'role': 'system', 'content': '你是资深翻译审校编辑。你会在忠实原文的前提下，把译稿润色成自然、准确、可发布的最终版本，只输出最终译文。'},
+                    {'role': 'user', 'content': self._build_polish_prompt(source_text, translated_text, source_lang, target_lang)}
+                ],
+                temperature=0
+            )
+            polished = self._normalize_translated_text(polished)
+            return polished or translated_text
+        except Exception as e:
+            self._add_log(f'润色阶段失败，保留初稿: {str(e)}', 'info')
+            return translated_text
 
     def _is_url_only_text(self, text):
         if not text:
@@ -319,48 +594,16 @@ class PDFTranslator:
     def _translate_text_openrouter_force_chinese(self, text, target_lang='zh'):
         """OpenRouter 二次强制重翻，尽量消除长英文残留。"""
         text = self._clean_text(text)
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json; charset=utf-8",
-            "HTTP-Referer": "https://pdf-translator.local",
-        }
-
-        lang_names = {
-            'en': '英语',
-            'zh': '中文',
-            'ja': '日语',
-            'ko': '韩语',
-            'fr': '法语',
-            'de': '德语',
-            'es': '西班牙语',
-            'ru': '俄语',
-            'ar': '阿拉伯语'
-        }
-        target_lang_name = lang_names.get(target_lang, target_lang)
-        prompt = (
-            f"将下面内容完整翻译成{target_lang_name}。\n"
-            "硬性要求：\n"
-            "1. 除 URL、页码、明确品牌名外，不允许保留英文句子。\n"
-            "2. 如果输出中还有完整英文短语或英文句子，视为失败。\n"
-            "3. 不得新增原文没有的项目符号、编号列表、示例、脚注、病症或说明。\n"
-            "4. 保留段落、项目符号和换行结构。\n"
-            "5. 只返回译文本身，不要解释。\n\n"
-            f"{text}"
-        )
-        data = {
-            "model": "deepseek/deepseek-chat",
-            "messages": [
-                {"role": "system", "content": "你是严格的中文翻译引擎。必须输出完整中文译文，不能保留整句英文。"},
-                {"role": "user", "content": prompt}
+        result = self._chat_completion(
+            [
+                {'role': 'system', 'content': '你是严格的中文翻译引擎。必须输出完整中文译文，不能保留整句英文，只输出译文本身。'},
+                {'role': 'user', 'content': self._build_translation_prompt(text, 'auto', target_lang, strict=True)}
             ],
-            "temperature": 0
-        }
-        response = self._session.post(url, headers=headers, json=data, timeout=75)
-        result = response.json()
-        if 'choices' in result and result['choices']:
-            return self._normalize_translated_text(result['choices'][0]['message']['content'].strip())
-        raise Exception(f"API Error: {result}")
+            api_type='openrouter',
+            temperature=0,
+            timeout=75
+        )
+        return self._normalize_translated_text(result)
 
     def _split_text_for_strict_retry(self, text, max_chars=260):
         """把长文本拆成更稳的小段，降低模型漏译后半段的概率。"""
@@ -669,10 +912,13 @@ class PDFTranslator:
             except Exception:
                 continue
 
-    def _build_font_candidates(self, registered_fonts, translated_text, original_font, is_bold, is_italic, is_chinese):
+    def _has_cjk_chars(self, text):
+        return bool(text and re.search(r'[\u4e00-\u9fff]', text))
+
+    def _build_font_candidates(self, registered_fonts, translated_text, original_font, is_bold, is_italic, has_cjk_chars):
         has_latin = bool(re.search(r'[A-Za-z0-9]', translated_text))
 
-        if is_chinese:
+        if has_cjk_chars:
             base = []
             if has_latin:
                 base.extend([name for name in ('ui_unicode', 'ui_heiti', 'ui_cjk') if name in registered_fonts])
@@ -709,9 +955,9 @@ class PDFTranslator:
         if layout_hint in ('caption', 'heading', 'short'):
             extra_bottom = original_size * 1.6
         elif layout_hint in ('list_item', 'list_cont'):
-            extra_bottom = original_size * 2.8
+            extra_bottom = original_size * 5.2
         else:
-            extra_bottom = original_size * 3.4
+            extra_bottom = original_size * 7.0
 
         expanded.y1 = min(next_block_ceiling, text_rect.y1 + extra_bottom)
 
@@ -739,6 +985,19 @@ class PDFTranslator:
             expanded.x1 = max(text_rect.x1, candidate_x1)
 
         return expanded
+
+    def _preferred_lineheight(self, layout_hint, is_chinese, translated_text):
+        if not is_chinese:
+            return None
+        if layout_hint in ('body', 'list_item', 'list_cont'):
+            if len(translated_text) >= 180:
+                return 0.95
+            if len(translated_text) >= 100:
+                return 0.97
+            return 1.0
+        if layout_hint == 'toc':
+            return 0.98
+        return 1.0
 
     def _classify_block_for_merge(self, block):
         text = block['text'].strip()
@@ -1216,27 +1475,6 @@ class PDFTranslator:
             # 清理文本中的特殊Unicode字符
             text = self._clean_text(text)
 
-            url = "https://api.deepseek.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json; charset=utf-8"
-            }
-
-            lang_names = {
-                'en': '英语',
-                'zh': '中文',
-                'ja': '日语',
-                'ko': '韩语',
-                'fr': '法语',
-                'de': '德语',
-                'es': '西班牙语',
-                'ru': '俄语',
-                'ar': '阿拉伯语'
-            }
-
-            target_lang_name = lang_names.get(target_lang, target_lang)
-            prompt = f"请将以下文本翻译成{target_lang_name}，只返回翻译结果：\n\n{text}"
-
             # 记录输入token
             input_tokens = self._estimate_tokens(text)
             self.input_tokens += input_tokens
@@ -1245,28 +1483,22 @@ class PDFTranslator:
             if self.input_tokens == input_tokens:
                 self._add_log(f'开始翻译，文本长度: {len(text)} 字符, 输入tokens: {input_tokens}', 'info')
 
-            data = {
-                "model": "deepseek-chat",
-                "messages": [
-                    {"role": "system", "content": "你是一个专业的翻译助手。"},
-                    {"role": "user", "content": prompt}
+            translated = self._chat_completion(
+                [
+                    {'role': 'system', 'content': '你是专业翻译助手。请保证准确、自然、术语一致，只输出译文本身。'},
+                    {'role': 'user', 'content': self._build_translation_prompt(text, source_lang, target_lang)}
                 ],
-                "temperature": 0.3
-            }
+                temperature=0.2,
+                timeout=60
+            )
+            translated = self._normalize_translated_text(translated)
+            translated = self._ensure_target_translation(text, translated, source_lang, target_lang)
+            translated = self._maybe_polish_translation(text, translated, source_lang, target_lang)
 
-            response = self._session.post(url, headers=headers, json=data, timeout=60)
-            result = response.json()
+            output_tokens = self._estimate_tokens(translated)
+            self.output_tokens += output_tokens
 
-            if 'choices' in result and len(result['choices']) > 0:
-                translated = result['choices'][0]['message']['content'].strip()
-
-                # 记录输出token
-                output_tokens = self._estimate_tokens(translated)
-                self.output_tokens += output_tokens
-
-                return translated
-            else:
-                raise Exception(f"API Error: {result}")
+            return translated
 
         except Exception as e:
             error_msg = str(e)
@@ -1291,53 +1523,26 @@ class PDFTranslator:
             # 清理文本中的特殊Unicode字符
             text = self._clean_text(text)
 
-            url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json; charset=utf-8"
-            }
-
-            lang_names = {
-                'en': '英语',
-                'zh': '中文',
-                'ja': '日语',
-                'ko': '韩语',
-                'fr': '法语',
-                'de': '德语',
-                'es': '西班牙语',
-                'ru': '俄语',
-                'ar': '阿拉伯语'
-            }
-
-            target_lang_name = lang_names.get(target_lang, target_lang)
-            prompt = f"请将以下文本翻译成{target_lang_name}，只返回翻译结果：\n\n{text}"
-
             # 记录输入token
             input_tokens = self._estimate_tokens(text)
             self.input_tokens += input_tokens
 
-            data = {
-                "model": "GLM-4-Flash",
-                "messages": [
-                    {"role": "system", "content": "你是一个专业的翻译助手。"},
-                    {"role": "user", "content": prompt}
+            translated = self._chat_completion(
+                [
+                    {'role': 'system', 'content': '你是专业翻译助手。请保证准确、自然、术语一致，只输出译文本身。'},
+                    {'role': 'user', 'content': self._build_translation_prompt(text, source_lang, target_lang)}
                 ],
-                "temperature": 0.3
-            }
+                temperature=0.2,
+                timeout=60
+            )
+            translated = self._normalize_translated_text(translated)
+            translated = self._ensure_target_translation(text, translated, source_lang, target_lang)
+            translated = self._maybe_polish_translation(text, translated, source_lang, target_lang)
 
-            response = self._session.post(url, headers=headers, json=data, timeout=60)
-            result = response.json()
+            output_tokens = self._estimate_tokens(translated)
+            self.output_tokens += output_tokens
 
-            if 'choices' in result and len(result['choices']) > 0:
-                translated = result['choices'][0]['message']['content'].strip()
-
-                # 记录输出token
-                output_tokens = self._estimate_tokens(translated)
-                self.output_tokens += output_tokens
-
-                return translated
-            else:
-                raise Exception(f"API Error: {result}")
+            return translated
 
         except Exception as e:
             error_msg = str(e)
@@ -1362,36 +1567,6 @@ class PDFTranslator:
             # 清理文本中的特殊Unicode字符
             text = self._clean_text(text)
 
-            url = "https://openrouter.ai/api/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json; charset=utf-8",
-                "HTTP-Referer": "https://pdf-translator.local",  # OpenRouter要求
-            }
-
-            lang_names = {
-                'en': '英语',
-                'zh': '中文',
-                'ja': '日语',
-                'ko': '韩语',
-                'fr': '法语',
-                'de': '德语',
-                'es': '西班牙语',
-                'ru': '俄语',
-                'ar': '阿拉伯语'
-            }
-
-            target_lang_name = lang_names.get(target_lang, target_lang)
-            prompt = (
-                f"把下面文本翻译成{target_lang_name}。\n"
-                "严格要求：\n"
-                "1. 只返回译文，不要解释、注释、括号说明或前后缀。\n"
-                "2. 保留项目符号、URL、数字、章节号和专有名词格式。\n"
-                "3. 不得新增原文没有的项目符号、编号列表、示例、脚注或说明。\n"
-                "4. 如果原文已经是目标语言或不需要翻译，原样返回。\n\n"
-                f"{text}"
-            )
-
             # 记录输入token
             input_tokens = self._estimate_tokens(text)
             self.input_tokens += input_tokens
@@ -1400,54 +1575,22 @@ class PDFTranslator:
             if self.input_tokens == input_tokens:
                 self._add_log(f'开始翻译，文本长度: {len(text)} 字符, 输入tokens: {input_tokens}', 'info')
 
-            data = {
-                "model": "deepseek/deepseek-chat",
-                "messages": [
-                    {"role": "system", "content": "你是严格的翻译引擎，只输出译文本身。禁止添加解释、备注、示例、总结或引号。"},
-                    {"role": "user", "content": prompt}
+            translated = self._chat_completion(
+                [
+                    {'role': 'system', 'content': '你是严格的翻译引擎，只输出译文本身。禁止添加解释、备注、示例、总结或引号。'},
+                    {'role': 'user', 'content': self._build_translation_prompt(text, source_lang, target_lang)}
                 ],
-                "temperature": 0
-            }
+                temperature=0,
+                timeout=60
+            )
+            translated = self._normalize_translated_text(translated)
+            translated = self._ensure_target_translation(text, translated, source_lang, target_lang)
+            translated = self._maybe_polish_translation(text, translated, source_lang, target_lang)
 
-            response = self._session.post(url, headers=headers, json=data, timeout=60)
-            result = response.json()
+            output_tokens = self._estimate_tokens(translated)
+            self.output_tokens += output_tokens
 
-            if 'choices' in result and len(result['choices']) > 0:
-                translated = result['choices'][0]['message']['content'].strip()
-                translated = self._normalize_translated_text(translated)
-
-                if self._should_retry_translation(text, translated, target_lang):
-                    retry_prompt = (
-                        f"把下面英文完整翻译成{target_lang_name}。\n"
-                        "严格要求：\n"
-                        "1. 除 URL、页码、专有名词外，不得保留整句英文。\n"
-                        "2. 不得新增原文没有的项目符号、编号列表、示例、脚注或说明。\n"
-                        "3. 只返回译文，不要解释。\n"
-                        "4. 保留项目符号和原有换行。\n\n"
-                        f"{text}"
-                    )
-                    retry_data = {
-                        "model": "deepseek/deepseek-chat",
-                        "messages": [
-                            {"role": "system", "content": "你是严格的翻译引擎，必须输出完整中文译文。"},
-                            {"role": "user", "content": retry_prompt}
-                        ],
-                        "temperature": 0
-                    }
-                    retry_response = self._session.post(url, headers=headers, json=retry_data, timeout=60)
-                    retry_result = retry_response.json()
-                    if 'choices' in retry_result and retry_result['choices']:
-                        translated = self._normalize_translated_text(
-                            retry_result['choices'][0]['message']['content'].strip()
-                        )
-
-                # 记录输出token
-                output_tokens = self._estimate_tokens(translated)
-                self.output_tokens += output_tokens
-
-                return translated
-            else:
-                raise Exception(f"API Error: {result}")
+            return translated
 
         except Exception as e:
             error_msg = str(e)
@@ -1468,75 +1611,31 @@ class PDFTranslator:
         if not texts:
             return []
 
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json; charset=utf-8",
-            "HTTP-Referer": "https://pdf-translator.local",
-        }
-
-        lang_names = {
-            'en': '英语',
-            'zh': '中文',
-            'ja': '日语',
-            'ko': '韩语',
-            'fr': '法语',
-            'de': '德语',
-            'es': '西班牙语',
-            'ru': '俄语',
-            'ar': '阿拉伯语'
-        }
-
-        target_lang_name = lang_names.get(target_lang, target_lang)
         items = []
         for idx, text in enumerate(texts):
             safe_text = html.escape(text, quote=False)
             items.append(f'<item id="{idx}">{safe_text}</item>')
         payload = "\n".join(items)
+        prompt = f"{self._build_batch_translation_prompt(texts, source_lang, target_lang)}\n\n{payload}"
 
-        prompt = (
-            f"把下面 XML 中每个 item 的内容分别翻译成{target_lang_name}。\n"
-            "严格要求：\n"
-            "1. 只返回 XML，不要解释。\n"
-            "2. 保留 item 标签和原有 id，不要增删、合并、重排。\n"
-            "3. 只翻译每个 item 标签内部的文本内容。\n"
-            "4. 保留项目符号、URL、数字、章节号和专有名词格式。\n"
-            "5. 如果某段本就不需要翻译，原样保留。\n\n"
-            f"{payload}"
-        )
-
-        data = {
-            "model": "deepseek/deepseek-chat",
-            "messages": [
-                {"role": "system", "content": "你是严格的 XML 翻译引擎。必须返回合法 XML，保持 item id 不变，只输出 XML。"},
-                {"role": "user", "content": prompt}
+        content = self._chat_completion(
+            [
+                {'role': 'system', 'content': '你是严格的 XML 翻译引擎。必须返回合法 XML，保持 item id 不变，只输出 XML。'},
+                {'role': 'user', 'content': prompt}
             ],
-            "temperature": 0
-        }
-
-        response = self._session.post(url, headers=headers, json=data, timeout=90)
-        result = response.json()
-        if 'choices' not in result or not result['choices']:
-            raise Exception(f"API Error: {result}")
-
-        content = result['choices'][0]['message']['content'].strip()
-        matches = re.findall(r'<item\s+id="(\d+)">(.*?)</item>', content, flags=re.DOTALL)
-        if len(matches) != len(texts):
-            raise ValueError(f"批量返回项数不匹配: expected={len(texts)}, actual={len(matches)}")
-
-        translated = [None] * len(texts)
-        for raw_idx, raw_text in matches:
-            idx = int(raw_idx)
-            if idx < 0 or idx >= len(texts):
-                raise ValueError(f"批量返回 id 越界: {idx}")
-            translated[idx] = self._normalize_translated_text(html.unescape(raw_text.strip()))
-
-        if any(item is None for item in translated):
-            raise ValueError("批量返回缺少部分 item")
+            api_type='openrouter',
+            temperature=0,
+            timeout=90
+        )
+        translated = self._extract_openrouter_batch_items(content, len(texts))
+        if all(item is None for item in translated):
+            raise ValueError("批量返回未解析出任何 item")
 
         for idx, translated_text in enumerate(translated):
+            if translated_text is None:
+                continue
             if self._should_retry_translation(texts[idx], translated_text, target_lang):
-                raise ValueError(f"批量返回存在未翻译项: {idx}")
+                translated[idx] = None
 
         return translated
 
@@ -1549,28 +1648,6 @@ class PDFTranslator:
             # 清理文本中的特殊Unicode字符
             text = self._clean_text(text)
 
-            url = "https://openrouter.ai/api/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json; charset=utf-8",
-                "HTTP-Referer": "https://pdf-translator.local",
-            }
-
-            lang_names = {
-                'en': '英语',
-                'zh': '中文',
-                'ja': '日语',
-                'ko': '韩语',
-                'fr': '法语',
-                'de': '德语',
-                'es': '西班牙语',
-                'ru': '俄语',
-                'ar': '阿拉伯语'
-            }
-
-            target_lang_name = lang_names.get(target_lang, target_lang)
-            prompt = f"请将以下文本翻译成{target_lang_name}，只返回翻译结果，不要添加任何解释：\n\n{text}"
-
             # 记录输入token
             input_tokens = self._estimate_tokens(text)
             self.input_tokens += input_tokens
@@ -1579,28 +1656,22 @@ class PDFTranslator:
             if self.input_tokens == input_tokens:
                 self._add_log(f'开始翻译，文本长度: {len(text)} 字符, 输入tokens: {input_tokens}', 'info')
 
-            data = {
-                "model": "moonshot/moonshot-v1-auto",
-                "messages": [
-                    {"role": "system", "content": "你是一个专业的翻译助手，请准确翻译文本，保持原文的格式和语气。"},
-                    {"role": "user", "content": prompt}
+            translated = self._chat_completion(
+                [
+                    {'role': 'system', 'content': '你是专业翻译助手。请准确翻译文本，保持原文格式和语气，只输出译文本身。'},
+                    {'role': 'user', 'content': self._build_translation_prompt(text, source_lang, target_lang)}
                 ],
-                "temperature": 0.1
-            }
+                temperature=0.1,
+                timeout=120
+            )
+            translated = self._normalize_translated_text(translated)
+            translated = self._ensure_target_translation(text, translated, source_lang, target_lang)
+            translated = self._maybe_polish_translation(text, translated, source_lang, target_lang)
 
-            response = self._session.post(url, headers=headers, json=data, timeout=120)
-            result = response.json()
+            output_tokens = self._estimate_tokens(translated)
+            self.output_tokens += output_tokens
 
-            if 'choices' in result and len(result['choices']) > 0:
-                translated = result['choices'][0]['message']['content'].strip()
-
-                # 记录输出token
-                output_tokens = self._estimate_tokens(translated)
-                self.output_tokens += output_tokens
-
-                return translated
-            else:
-                raise Exception(f"API Error: {result}")
+            return translated
 
         except Exception as e:
             error_msg = str(e)
@@ -1624,28 +1695,6 @@ class PDFTranslator:
             # 清理文本中的特殊Unicode字符
             text = self._clean_text(text)
 
-            url = "https://openrouter.ai/api/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json; charset=utf-8",
-                "HTTP-Referer": "https://pdf-translator.local",
-            }
-
-            lang_names = {
-                'en': '英语',
-                'zh': '中文',
-                'ja': '日语',
-                'ko': '韩语',
-                'fr': '法语',
-                'de': '德语',
-                'es': '西班牙语',
-                'ru': '俄语',
-                'ar': '阿拉伯语'
-            }
-
-            target_lang_name = lang_names.get(target_lang, target_lang)
-            prompt = f"请将以下文本翻译成{target_lang_name}，只返回翻译结果，不要添加任何解释：\n\n{text}"
-
             # 记录输入token
             input_tokens = self._estimate_tokens(text)
             self.input_tokens += input_tokens
@@ -1654,28 +1703,22 @@ class PDFTranslator:
             if self.input_tokens == input_tokens:
                 self._add_log(f'开始翻译，文本长度: {len(text)} 字符, 输入tokens: {input_tokens}', 'info')
 
-            data = {
-                "model": "openai/gpt-4-turbo",
-                "messages": [
-                    {"role": "system", "content": "你是一个专业的翻译助手，请准确翻译文本，保持原文的格式和语气。"},
-                    {"role": "user", "content": prompt}
+            translated = self._chat_completion(
+                [
+                    {'role': 'system', 'content': '你是专业翻译助手。请准确翻译文本，保持原文格式和语气，只输出译文本身。'},
+                    {'role': 'user', 'content': self._build_translation_prompt(text, source_lang, target_lang)}
                 ],
-                "temperature": 0.1
-            }
+                temperature=0.1,
+                timeout=120
+            )
+            translated = self._normalize_translated_text(translated)
+            translated = self._ensure_target_translation(text, translated, source_lang, target_lang)
+            translated = self._maybe_polish_translation(text, translated, source_lang, target_lang)
 
-            response = self._session.post(url, headers=headers, json=data, timeout=120)
-            result = response.json()
+            output_tokens = self._estimate_tokens(translated)
+            self.output_tokens += output_tokens
 
-            if 'choices' in result and len(result['choices']) > 0:
-                translated = result['choices'][0]['message']['content'].strip()
-
-                # 记录输出token
-                output_tokens = self._estimate_tokens(translated)
-                self.output_tokens += output_tokens
-
-                return translated
-            else:
-                raise Exception(f"API Error: {result}")
+            return translated
 
         except Exception as e:
             error_msg = str(e)
@@ -1827,8 +1870,13 @@ class PDFTranslator:
 
         doc = None
         try:
+            self._emit_strategy_notice_once()
             self._add_log('========== 开始翻译任务 ==========', 'info')
             self._add_log(f'使用文本块级并发翻译，{concurrency} 个线程同时工作 ⚡', 'success')
+            self._add_log(
+                f'翻译策略: mode={self._effective_translation_mode()} audience={self.audience} style={self.style}',
+                'info'
+            )
 
             # 检查文件是否存在
             self._add_log(f'输入文件: {input_path}', 'info')
@@ -2179,15 +2227,17 @@ class PDFTranslator:
 
                         api_time = time.time() - api_start_time
                         output_tokens = self._estimate_tokens(combined_translated) if combined_translated is not None else sum(
-                            self._estimate_tokens(part) for part in parts
+                            self._estimate_tokens(part) for part in parts if part
                         )
 
                         # 拆分结果；如数量不匹配则逐一翻译（不回退原文）
                         if self.api_type != 'openrouter':
                             parts = combined_translated.split(BATCH_SEPARATOR)
+                        missing_indexes = [i for i, part in enumerate(parts) if not part]
                         if len(parts) != len(blocks):
                             print(f'[WARN] 批次拆分不匹配: 期望 {len(blocks)}, 实际 {len(parts)}，逐一翻译回退')
                             parts = []
+                            missing_indexes = list(range(len(texts)))
                             for t in texts:
                                 try:
                                     if self.api_type == 'google':
@@ -2199,6 +2249,18 @@ class PDFTranslator:
                                     parts.append(tr if tr else t)
                                 except Exception:
                                     parts.append(t)
+                        elif missing_indexes:
+                            print(f'[WARN] 批次返回缺少 {len(missing_indexes)} 项，执行局部补翻')
+                            for missing_idx in missing_indexes:
+                                try:
+                                    if self.api_type == 'google':
+                                        parts[missing_idx] = GoogleTranslator(
+                                            source=normalized_source, target=normalized_target
+                                        ).translate(texts[missing_idx])
+                                    else:
+                                        parts[missing_idx] = self._translate_text(texts[missing_idx], source_lang, target_lang)
+                                except Exception:
+                                    parts[missing_idx] = texts[missing_idx]
 
                         final_parts = []
                         for i, translated in enumerate(parts):
@@ -2452,6 +2514,7 @@ class PDFTranslator:
 
             self._add_log('正在创建新文档（保留图片，移除原文）...', 'info')
             new_doc = fitz.open()
+            inserted_image_xrefs = {}
 
             for page_num in range(total_pages):
                 self._check_cancelled()
@@ -2497,11 +2560,13 @@ class PDFTranslator:
                     )
                     chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', translated_page_text))
                     total_chars = len(translated_page_text)
+                    has_cjk_chars = chinese_chars > 0
                     is_chinese = chinese_chars > total_chars * 0.3 if total_chars > 0 else False
                     font_candidates = self._build_font_candidates(
-                        page_registered_fonts, translated_page_text, 'helv', False, False, is_chinese
+                        page_registered_fonts, translated_page_text, 'helv', False, False, has_cjk_chars
                     )
-                    font_sizes = [11, 10, 9, 8, 7, 6]
+                    font_sizes = [12, 11.5, 11, 10.5, 10, 9, 8]
+                    lineheight = 0.97 if has_cjk_chars else None
                     written = False
 
                     for font_name in font_candidates:
@@ -2512,6 +2577,7 @@ class PDFTranslator:
                                     translated_page_text,
                                     fontsize=fontsize,
                                     fontname=font_name,
+                                    lineheight=lineheight,
                                     color=(0, 0, 0),
                                     align=0
                                 )
@@ -2545,12 +2611,26 @@ class PDFTranslator:
                 # 复制原页面的所有图片
                 try:
                     image_list = page.get_images()
-                    for img_index, img in enumerate(image_list):
+                    for img in image_list:
                         try:
                             xref = img[0]
                             img_rects = page.get_image_rects(xref)
+                            cached_xref = inserted_image_xrefs.get(xref)
+                            if cached_xref is None:
+                                image_info = doc.extract_image(xref)
+                                image_bytes = image_info.get('image')
+                                image_mask = image_info.get('smask', 0)
+                                has_alpha = bool(image_mask)
                             for img_rect in img_rects:
-                                new_page.insert_image(img_rect, pixmap=fitz.Pixmap(doc, xref))
+                                if cached_xref is not None:
+                                    new_page.insert_image(img_rect, xref=cached_xref)
+                                    continue
+                                cached_xref = new_page.insert_image(
+                                    img_rect,
+                                    stream=image_bytes,
+                                    alpha=1 if has_alpha else 0
+                                )
+                                inserted_image_xrefs[xref] = cached_xref
                         except Exception as img_err:
                             print(f'[DEBUG] 图片复制失败(页{page_num+1}): {str(img_err)[:50]}')
                 except Exception as e:
@@ -2594,11 +2674,12 @@ class PDFTranslator:
                         # 检测翻译后文本的主要语言
                         chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', translated_text))
                         total_chars = len(translated_text)
+                        has_cjk_chars = chinese_chars > 0
                         is_chinese = chinese_chars > total_chars * 0.3 if total_chars > 0 else False
 
                         # 根据翻译后文本语言选择字体
                         font_names = self._build_font_candidates(
-                            page_registered_fonts, translated_text, original_font, is_bold, is_italic, is_chinese
+                            page_registered_fonts, translated_text, original_font, is_bold, is_italic, has_cjk_chars
                         )
                         if layout_hint == 'toc':
                             toc_fonts = [name for name in ('ui_unicode', 'ui_cjk', 'ui_heiti', 'helv') if name in font_names or name in page_registered_fonts]
@@ -2656,6 +2737,7 @@ class PDFTranslator:
                             expanded_rect.x1 = max(expanded_rect.x1, new_page.rect.width - 72)
                         safe_text_rect = self._clip_rect_to_avoid_images(text_rect, image_rects)
                         safe_expanded_rect = self._clip_rect_to_avoid_images(expanded_rect, image_rects)
+                        lineheight = self._preferred_lineheight(layout_hint, has_cjk_chars, translated_text)
 
                         for font_name in font_names:
                             single_line_heading = (
@@ -2672,7 +2754,10 @@ class PDFTranslator:
                                 for fontsize in font_sizes[:-1]:
                                     try:
                                         if layout_hint in ('caption', 'heading', 'short') or (layout_hint == 'toc' and len(translated_text) <= 32):
-                                            draw_font = 'ui_unicode' if 'ui_unicode' in page_registered_fonts else font_name
+                                            if has_cjk_chars and 'ui_unicode' in page_registered_fonts:
+                                                draw_font = 'ui_unicode'
+                                            else:
+                                                draw_font = font_name
                                         else:
                                             draw_font = font_name
                                         new_page.insert_text(
@@ -2691,20 +2776,29 @@ class PDFTranslator:
 
                             rect_variants = [safe_text_rect]
                             if safe_expanded_rect != safe_text_rect:
-                                rect_variants.append(safe_expanded_rect)
-                            if safe_expanded_rect != safe_text_rect:
                                 wide_rect = fitz.Rect(safe_text_rect.x0, safe_text_rect.y0, safe_expanded_rect.x1, safe_text_rect.y1)
                                 wide_rect = self._clip_rect_to_avoid_images(wide_rect, image_rects)
-                                if wide_rect != safe_text_rect and wide_rect != safe_expanded_rect:
-                                    rect_variants.insert(1, wide_rect)
-                            for candidate_rect in rect_variants:
-                                for fontsize in font_sizes:
+                                if wide_rect != safe_text_rect:
+                                    rect_variants.append(wide_rect)
+                                tall_rect = fitz.Rect(safe_text_rect.x0, safe_text_rect.y0, safe_text_rect.x1, safe_expanded_rect.y1)
+                                tall_rect = self._clip_rect_to_avoid_images(tall_rect, image_rects)
+                                if tall_rect != safe_text_rect and tall_rect != wide_rect:
+                                    rect_variants.append(tall_rect)
+                                full_rect = fitz.Rect(safe_text_rect.x0, safe_text_rect.y0, safe_expanded_rect.x1, safe_expanded_rect.y1)
+                                full_rect = self._clip_rect_to_avoid_images(full_rect, image_rects)
+                                if full_rect != safe_text_rect and full_rect != wide_rect and full_rect != tall_rect:
+                                    rect_variants.append(full_rect)
+                                if safe_expanded_rect not in rect_variants:
+                                    rect_variants.append(safe_expanded_rect)
+                            for fontsize in font_sizes:
+                                for candidate_rect in rect_variants:
                                     try:
                                         result = new_page.insert_textbox(
                                             candidate_rect,
                                             translated_text,
                                             fontsize=fontsize,
                                             fontname=font_name,
+                                            lineheight=lineheight,
                                             color=text_color,
                                             align=0
                                         )
@@ -2727,6 +2821,7 @@ class PDFTranslator:
                                         translated_text,
                                         fontsize=max(7, base_fontsize * 0.72),
                                         fontname=font_name,
+                                        lineheight=lineheight,
                                         color=text_color,
                                         align=0
                                     )
@@ -2743,7 +2838,7 @@ class PDFTranslator:
                             # 最后兜底：在矩形起点强制插入单行文本，避免丢失
                             try:
                                 fallback_font = "helv"
-                                if is_chinese:
+                                if has_cjk_chars:
                                     for preferred in ("ui_unicode", "ui_heiti", "ui_cjk"):
                                         if preferred in page_registered_fonts:
                                             fallback_font = preferred
@@ -2796,7 +2891,14 @@ class PDFTranslator:
                 self._add_log(f'⚠️ 输出目录不存在: {output_dir}', 'error')
 
             # 保存新文档（包含翻译后的文本和原图）
-            new_doc.save(output_path)
+            new_doc.save(
+                output_path,
+                garbage=4,
+                clean=1,
+                deflate=1,
+                deflate_images=1,
+                deflate_fonts=1
+            )
             new_doc.close()
 
             # 验证文件是否保存成功
@@ -2832,12 +2934,17 @@ class PDFTranslator:
 
         total_start_time = time.time()
 
+        self._emit_strategy_notice_once()
         self._add_log('========== 开始文本翻译任务 ==========', 'info')
         self._add_log(f'输入文件: {input_path}', 'info')
         self._add_log(f'输出文件: {output_path}', 'info')
         self._add_log(f'源语言: {source_lang}', 'info')
         self._add_log(f'目标语言: {target_lang}', 'info')
         self._add_log(f'并发线程数: {concurrency}', 'info')
+        self._add_log(
+            f'翻译策略: mode={self._effective_translation_mode()} audience={self.audience} style={self.style}',
+            'info'
+        )
 
         # 语言代码映射
         lang_map = {

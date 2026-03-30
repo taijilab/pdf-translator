@@ -22,6 +22,9 @@ const cancelBtn = document.getElementById('cancelBtn');
 const fileAnalysisDiv = document.getElementById('fileAnalysis');
 const apiKeyInput = document.getElementById('apiKey');
 const concurrencyInput = document.getElementById('concurrency');
+const translationModeSelect = document.getElementById('translationMode');
+const translationAudienceSelect = document.getElementById('translationAudience');
+const translationStyleSelect = document.getElementById('translationStyle');
 const comparisonContent = document.getElementById('processContent');
 const glossaryTermsInput = document.getElementById('glossaryTerms');
 const glossarySuggestions = document.getElementById('glossarySuggestions');
@@ -310,6 +313,9 @@ function parseImportedGlossaryText(rawText) {
 function restoreSettings() {
     const savedApiType = localStorage.getItem('lastApiType');
     const savedConcurrency = localStorage.getItem('lastConcurrency');
+    const savedTranslationMode = localStorage.getItem('lastTranslationMode');
+    const savedTranslationAudience = localStorage.getItem('lastTranslationAudience');
+    const savedTranslationStyle = localStorage.getItem('lastTranslationStyle');
 
     if (savedApiType) {
         apiTypeSelect.value = savedApiType;
@@ -321,6 +327,18 @@ function restoreSettings() {
         concurrencyInput.value = savedConcurrency;
     }
 
+    if (savedTranslationMode) {
+        translationModeSelect.value = savedTranslationMode;
+    }
+
+    if (savedTranslationAudience) {
+        translationAudienceSelect.value = savedTranslationAudience;
+    }
+
+    if (savedTranslationStyle) {
+        translationStyleSelect.value = savedTranslationStyle;
+    }
+
     // 清理旧版本遗留的本地 API Key 缓存
     localStorage.removeItem('lastApiKey');
 }
@@ -329,6 +347,9 @@ function restoreSettings() {
 function saveSettings() {
     localStorage.setItem('lastApiType', apiTypeSelect.value);
     localStorage.setItem('lastConcurrency', concurrencyInput.value);
+    localStorage.setItem('lastTranslationMode', translationModeSelect.value);
+    localStorage.setItem('lastTranslationAudience', translationAudienceSelect.value);
+    localStorage.setItem('lastTranslationStyle', translationStyleSelect.value);
 }
 
 // API选择变化时显示/隐藏API密钥输入并保存
@@ -348,6 +369,18 @@ apiKeyInput.addEventListener('input', () => {
 
 // 并发数变化时保存
 concurrencyInput.addEventListener('input', () => {
+    saveSettings();
+});
+
+translationModeSelect.addEventListener('change', () => {
+    saveSettings();
+});
+
+translationAudienceSelect.addEventListener('change', () => {
+    saveSettings();
+});
+
+translationStyleSelect.addEventListener('change', () => {
     saveSettings();
 });
 
@@ -804,8 +837,8 @@ translateForm.addEventListener('submit', async (e) => {
     document.getElementById('completionActions').hidden = true; // 隐藏完成按钮
 
     // 生成任务ID
-    const taskId = 'task_' + Date.now()
-    currentTaskId = taskId;;
+    const taskId = 'task_' + Date.now();
+    currentTaskId = taskId;
 
     // 添加初始日志
     addLog('开始翻译任务...', 'info');
@@ -814,6 +847,9 @@ translateForm.addEventListener('submit', async (e) => {
     addLog(`源语言: ${document.getElementById('sourceLang').value}`, 'info');
     addLog(`目标语言: ${document.getElementById('targetLang').value}`, 'info');
     addLog(`输出格式: ${document.getElementById('outputFormat').value}`, 'info');
+    addLog(`翻译模式: ${translationModeSelect.value}`, 'info');
+    addLog(`目标读者: ${translationAudienceSelect.value}`, 'info');
+    addLog(`译文风格: ${translationStyleSelect.value}`, 'info');
 
     // 获取并发数
     const concurrency = parseInt(document.getElementById('concurrency').value) || 4;
@@ -832,6 +868,9 @@ translateForm.addEventListener('submit', async (e) => {
     formData.append('task_id', taskId);
     formData.append('concurrency', concurrency);
     formData.append('glossary_terms', JSON.stringify(parseGlossaryTerms(glossaryTermsInput.value)));
+    formData.append('translation_mode', translationModeSelect.value);
+    formData.append('translation_audience', translationAudienceSelect.value);
+    formData.append('translation_style', translationStyleSelect.value);
 
     // 启动实时计时器
     startElapsedTimeTimer();

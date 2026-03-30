@@ -398,6 +398,49 @@ header h1 {
     border-radius: 4px;
 }
 
+.translation-strategy-section {
+    margin-bottom: 20px;
+    padding: 16px;
+    background: #fffaf0;
+    border: 1px solid #f2d8a7;
+    border-radius: 10px;
+}
+
+.translation-strategy-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+
+.translation-strategy-header label {
+    color: #555;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.translation-strategy-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: #fff1cc;
+    color: #9a6700;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.strategy-row {
+    margin-bottom: 0;
+}
+
+.translation-strategy-note {
+    color: #7a6230;
+    font-size: 12px;
+    margin-top: 10px;
+}
+
 .glossary-section {
     margin-bottom: 20px;
     padding: 16px;
