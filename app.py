@@ -371,6 +371,8 @@ def analyze():
         analysis['glossary_file_key'] = glossary_state['file_key']
         analysis['glossary_source_path'] = glossary_state['source_path']
         analysis['suggested_terms'] = extract_glossary_candidates(doc, glossary_terms)
+        # 为前端和旧字段兼容保留统一语言代码
+        analysis['lang_code'] = analysis.get('detected_lang', 'auto')
 
         # 删除临时文件
         os.remove(filepath)
@@ -498,7 +500,10 @@ def translate():
             progress_queue.put({
                 'status': 'completed',
                 'task_id': task_id,
-                'output_file': output_filename
+                'output_file': output_filename,
+                'input_tokens': translator.input_tokens,
+                'output_tokens': translator.output_tokens,
+                'estimated_cost': round(translator._calculate_cost(), 4)
             })
 
         except Exception as e:

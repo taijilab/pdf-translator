@@ -309,7 +309,6 @@ function parseImportedGlossaryText(rawText) {
 // 从localStorage恢复上次的设置
 function restoreSettings() {
     const savedApiType = localStorage.getItem('lastApiType');
-    const savedApiKey = localStorage.getItem('lastApiKey');
     const savedConcurrency = localStorage.getItem('lastConcurrency');
 
     if (savedApiType) {
@@ -318,19 +317,17 @@ function restoreSettings() {
         apiTypeSelect.dispatchEvent(new Event('change'));
     }
 
-    if (savedApiKey) {
-        apiKeyInput.value = savedApiKey;
-    }
-
     if (savedConcurrency) {
         concurrencyInput.value = savedConcurrency;
     }
+
+    // 清理旧版本遗留的本地 API Key 缓存
+    localStorage.removeItem('lastApiKey');
 }
 
 // 保存设置到localStorage
 function saveSettings() {
     localStorage.setItem('lastApiType', apiTypeSelect.value);
-    localStorage.setItem('lastApiKey', apiKeyInput.value);
     localStorage.setItem('lastConcurrency', concurrencyInput.value);
 }
 
@@ -656,12 +653,13 @@ async function handleFile(file) {
             renderGlossarySuggestions(data.suggested_terms || []);
 
             // 根据检测到的语言自动设置源语言
-            if (data.lang_code && data.lang_code !== 'unknown') {
+            const detectedLangCode = data.detected_lang || data.lang_code;
+            if (detectedLangCode && detectedLangCode !== 'unknown' && detectedLangCode !== 'auto') {
                 const sourceLangSelect = document.getElementById('sourceLang');
                 // 尝试匹配语言代码
                 let matchedOption = null;
                 for (let i = 0; i < sourceLangSelect.options.length; i++) {
-                    if (sourceLangSelect.options[i].value === data.lang_code) {
+                    if (sourceLangSelect.options[i].value === detectedLangCode) {
                         matchedOption = sourceLangSelect.options[i];
                         break;
                     }
@@ -669,7 +667,7 @@ async function handleFile(file) {
 
                 // 如果找到匹配的语言，设置源语言
                 if (matchedOption) {
-                    sourceLangSelect.value = data.lang_code;
+                    sourceLangSelect.value = detectedLangCode;
                     console.log(`自动设置源语言为: ${matchedOption.text}`);
                 }
             }
