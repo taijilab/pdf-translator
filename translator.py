@@ -213,8 +213,16 @@ class PDFTranslator:
         patterns = [
             r'严格遵循',
             r'严格遵照',
+            r'根据翻译要求',
+            r'根据提供的翻译要求',
             r'处理原则',
             r'处理方式',
+            r'处理要点',
+            r'已处理',
+            r'已完整转化',
+            r'已消除',
+            r'未保留',
+            r'未添加任何解释',
             r'符合以下',
             r'未添加额外说明',
             r'完全符合要求',
@@ -231,6 +239,70 @@ class PDFTranslator:
             r'(?m)^\d+\.\s+',
         ]
         return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns)
+
+    def _count_list_lines(self, text):
+        return sum(
+            1
+            for line in text.splitlines()
+            if re.match(r'^\s*(?:[•●◆◾▪◦■□▪\-*]|(?:\d+|[A-Za-z])[.)])\s+', line.strip())
+        )
+
+    def _has_suspicious_structure_drift(self, source_text, translated_text):
+        source_lines = [line.strip() for line in source_text.splitlines() if line.strip()]
+        translated_lines = [line.strip() for line in translated_text.splitlines() if line.strip()]
+        if not source_lines or not translated_lines:
+            return False
+
+        source_list_lines = self._count_list_lines(source_text)
+        translated_list_lines = self._count_list_lines(translated_text)
+        if source_list_lines == 0 and translated_list_lines >= 3:
+            return True
+        if translated_list_lines >= source_list_lines + 3 and translated_list_lines >= 4:
+            return True
+
+        source_numbered = sum(1 for line in source_lines if re.match(r'^\d+[.)]\s+', line))
+        translated_numbered = sum(1 for line in translated_lines if re.match(r'^\d+[.)]\s+', line))
+        if translated_numbered >= source_numbered + 2 and translated_numbered >= 2:
+            return True
+
+        return False
+
+    def _is_meta_translation_line(self, line):
+        normalized = " ".join(line.strip().split())
+        if not normalized:
+            return False
+
+        patterns = [
+            r'根据(?:提供的)?翻译要求',
+            r'硬性要求',
+            r'处理原则',
+            r'输出要求',
+            r'严格实现',
+            r'完整转化',
+            r'完整翻译',
+            r'已处理',
+            r'未保留',
+            r'未添加任何解释',
+            r'解释性内容',
+            r'符合中文语序',
+            r'品牌名',
+            r'译为',
+            r'保留原文',
+            r'删除原文所有英文',
+            r'不允许保留英文句子',
+        ]
+        if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns):
+            return True
+
+        if re.match(r'^\d+\.\s*', normalized) and (
+            re.search(r'(翻译|英文|中文|术语|原文|品牌|句式|语序|标点|被动语态|缩进|格式层级|原句|译法|关键概念|保留引号|处理)', normalized, flags=re.IGNORECASE)
+        ):
+            return True
+
+        if len(re.findall(r'[A-Za-z]', normalized)) >= 12 and re.search(r'(译|翻译|原文|术语)', normalized):
+            return True
+
+        return False
 
     def _has_repeated_lines(self, text):
         lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
@@ -271,8 +343,9 @@ class PDFTranslator:
             "硬性要求：\n"
             "1. 除 URL、页码、明确品牌名外，不允许保留英文句子。\n"
             "2. 如果输出中还有完整英文短语或英文句子，视为失败。\n"
-            "3. 保留段落、项目符号和换行结构。\n"
-            "4. 只返回译文本身，不要解释。\n\n"
+            "3. 不得新增原文没有的项目符号、编号列表、示例、脚注、病症或说明。\n"
+            "4. 保留段落、项目符号和换行结构。\n"
+            "5. 只返回译文本身，不要解释。\n\n"
             f"{text}"
         )
         data = {
@@ -391,6 +464,8 @@ class PDFTranslator:
             return True
         if self._has_repeated_lines(translated):
             return True
+        if self._has_suspicious_structure_drift(source_text, translated_text):
+            return True
         if self._contains_meta_translation_note(translated):
             return True
         return False
@@ -405,7 +480,7 @@ class PDFTranslator:
             if self.api_type == 'google':
                 retried = self._translate_text_google(source_text, source_lang, target_lang)
             elif self.api_type == 'openrouter':
-                retried = self._translate_text_openrouter_force_chinese(source_text, target_lang)
+                retried = self._strict_translate_text(source_text, source_lang, target_lang)
             else:
                 retried = self._translate_text(source_text, source_lang, target_lang)
 
@@ -445,15 +520,36 @@ class PDFTranslator:
         text = re.sub(r'(?i)w\s+w\s+w\s*\.\s*', 'www.', text)
         text = re.sub(r'\s+\)', ')', text)
         text = re.sub(r'\(\s+', '(', text)
+        text = re.sub(r'(?is)[（(](?:根据(?:提供的)?翻译要求|译文|翻译说明|硬性要求|处理原则|输出要求)[^）)]{0,500}[）)]', '', text)
+        text = re.sub(r'(?is)(?:根据(?:提供的)?翻译要求|硬性要求|处理原则|输出要求)[：:].{0,600}(?=\n{2,}|$)', '', text)
+        text = re.sub(r'(?is)^（?(?:译文|翻译|根据提供的翻译要求|硬性要求)[^。\n]{0,120}[：:][\s\S]*?(?=\n{2,}|$)', '\n', text)
+        text = re.sub(r'(?im)^\s*（?(?:译文|翻译|根据提供的翻译要求|硬性要求|处理原则|输出要求)[^)：:\n]{0,80}[：:）)]?\s*.*$', '', text)
+        text = re.sub(r'(?im)^\s*\d+\.\s*(?:所有|保持|禁止|仅返回|不得|不允许|确保|输出|保留|根据).*$','', text)
+        text = re.sub(r'(?im)^\s*[（(]?(?:注|说明|译者注|翻译注)[：:].*$', '', text)
+        text = re.sub(r'(?im)^\s*[（(]?翻译\s*$', '', text)
+        text = re.sub(r'(?im)^\s*根据提供的翻译要求.*$', '', text)
+        text = re.sub(r'(?im)^\s*硬性要求.*$', '', text)
         text = re.sub(r'\n?注释[:：]\n?(?:\d+\.\s*.*(?:\n|$)){1,6}', '\n', text, flags=re.IGNORECASE)
         text = re.sub(r'\n?说明[:：]\n?(?:[-•\d].*(?:\n|$)){1,8}', '\n', text, flags=re.IGNORECASE)
         text = re.sub(r'(?s)[（(]说明[:：].*$', '', text)
         text = re.sub(r'(?s)说明[:：].*$', '', text)
         text = re.sub(r'[\(（]保留原排版.*?[\)）]', '', text)
+        text = re.sub(r'(?im)^.*(?:根据翻译要求|根据提供的翻译要求|硬性要求|处理原则|输出要求|已处理商标符号|已完整转化|未保留任何英文|未添加任何解释|解释性内容).*$','', text)
         text = re.sub(r'(?m)^(?:注[:：]|输出[:：]?|翻译[:：]?|完全符合要求.*|严格遵循要求.*|章节编号.*|括号使用.*|空行结构.*)$', '', text)
         text = re.sub(r'(?m)^\d+\.\s*(?:严格遵循要求.*|确保未出现.*|数字.*|空行结构.*|完全符合.*)$', '', text)
         text = re.sub(r'（注：.*?）', '', text, flags=re.DOTALL)
         text = re.sub(r'\(注：.*?\)', '', text, flags=re.DOTALL)
+        text = re.sub(r'(?im)^\s*[?？]{4,}.*$', '', text)
+        cleaned_lines = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                cleaned_lines.append('')
+                continue
+            if self._is_meta_translation_line(line):
+                continue
+            cleaned_lines.append(raw_line)
+        text = "\n".join(cleaned_lines)
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
 
@@ -599,23 +695,74 @@ class PDFTranslator:
             return ['helv-italic', 'helv', 'times-italic']
         return ['helv', 'times-roman', 'courier']
 
+    def _rect_vertical_overlap(self, rect_a, rect_b):
+        return max(0, min(rect_a.y1, rect_b.y1) - max(rect_a.y0, rect_b.y0))
+
+    def _rect_horizontal_overlap(self, rect_a, rect_b):
+        return max(0, min(rect_a.x1, rect_b.x1) - max(rect_a.x0, rect_b.x0))
+
+    def _expand_text_rect(self, text_rect, layout_hint, original_size, page_rect, page_bottom, next_top, image_rects):
+        right_margin = 72
+        next_block_ceiling = page_bottom if next_top is None else max(text_rect.y1, next_top - 6)
+        expanded = fitz.Rect(text_rect)
+
+        if layout_hint in ('caption', 'heading', 'short'):
+            extra_bottom = original_size * 1.6
+        elif layout_hint in ('list_item', 'list_cont'):
+            extra_bottom = original_size * 2.8
+        else:
+            extra_bottom = original_size * 3.4
+
+        expanded.y1 = min(next_block_ceiling, text_rect.y1 + extra_bottom)
+
+        candidate_x1 = page_rect.width - right_margin
+        for image_rect in image_rects:
+            if self._rect_vertical_overlap(expanded, image_rect) < 6:
+                continue
+            if image_rect.x0 > text_rect.x0 and image_rect.x0 < candidate_x1:
+                candidate_x1 = min(candidate_x1, max(text_rect.x1, image_rect.x0 - 8))
+
+        lower_limit = min(expanded.y1, next_block_ceiling)
+        for image_rect in image_rects:
+            if image_rect.y0 <= text_rect.y0 + 6:
+                continue
+            if self._rect_horizontal_overlap(expanded, image_rect) < min(24, expanded.width * 0.2):
+                continue
+            lower_limit = min(lower_limit, max(text_rect.y1, image_rect.y0 - 8))
+        expanded.y1 = min(next_block_ceiling, max(text_rect.y1, lower_limit))
+
+        if layout_hint in ('caption', 'heading', 'short', 'toc'):
+            expanded.x1 = max(text_rect.x1, candidate_x1)
+        elif layout_hint in ('list_item', 'list_cont'):
+            expanded.x1 = max(text_rect.x1, candidate_x1)
+        else:
+            expanded.x1 = max(text_rect.x1, candidate_x1)
+
+        return expanded
+
     def _classify_block_for_merge(self, block):
         text = block['text'].strip()
         normalized = " ".join(text.split())
         rect = block['rect']
         width = max(1, rect.width)
         x0 = rect.x0
+        font_info = block.get('font_info', {})
+        font_size = font_info.get('size', 11)
+        font_flags = font_info.get('flags', 0)
+        is_bold = (font_flags & 16) != 0
+        sentence_like = normalized.endswith(('。', '！', '？', '.', '!', '?'))
 
         is_footer = self._is_page_footer_text(text)
         starts_bullet = bool(re.match(r'^[•●◆◾▪◦■□▪\-\*\d]+\s+', text))
-        bullet_heading = starts_bullet and normalized.endswith(':') and len(normalized) <= 80
+        bullet_heading = starts_bullet and normalized.endswith(':') and len(normalized) <= 80 and (is_bold or font_size >= 11.5)
         is_continuation = (not starts_bullet) and x0 >= 100 and len(normalized) > 20
         is_caption = bool(re.match(r'^(Chapter\s+\d+|Variations|Wrist Mobility Stretches|Wrist Relief Position|What is|Introduction to)', normalized, re.IGNORECASE))
         is_heading = (
             (normalized.endswith(':') and len(normalized) <= 80) or
-            (len(normalized) <= 40 and normalized.isupper())
+            (len(normalized) <= 40 and normalized.isupper()) or
+            (len(normalized) <= 22 and not sentence_like and (is_bold or font_size >= 13))
         )
-        is_short = len(normalized) <= 32
+        is_short = len(normalized) <= 20 and not sentence_like and (is_bold or font_size >= 13)
 
         if is_footer:
             kind = 'footer'
@@ -679,7 +826,12 @@ class PDFTranslator:
                 compatible_list and list_same_column
             )
 
-            if should_merge and gap <= max_vertical_gap and merged_len <= max_chars:
+            merge_gap_limit = 12 if current_meta['kind'] in ('body', 'list_item', 'list_cont') else max_vertical_gap
+            narrow_column = current_rect.width <= 250 or block_rect.width <= 250
+            if narrow_column:
+                merge_gap_limit = min(merge_gap_limit, 8)
+
+            if should_merge and gap <= merge_gap_limit and merged_len <= max_chars:
                 joiner = "\n\n" if gap > 10 else "\n"
                 current['text'] = f"{current['text'].rstrip()}{joiner}{block['text'].lstrip()}"
                 current['rect'] = fitz.Rect(
@@ -707,6 +859,28 @@ class PDFTranslator:
             block['block_idx'] = idx
 
         return merged
+
+    def _clip_rect_to_avoid_images(self, rect, image_rects, min_width=90, min_height=16):
+        clipped = fitz.Rect(rect)
+
+        for image_rect in image_rects:
+            inter = clipped & image_rect
+            if inter.is_empty or inter.get_area() <= 20:
+                continue
+
+            if inter.width >= inter.height:
+                new_y1 = image_rect.y0 - 6
+                if new_y1 - clipped.y0 >= min_height:
+                    clipped.y1 = min(clipped.y1, new_y1)
+            else:
+                if image_rect.x0 > clipped.x0:
+                    new_x1 = image_rect.x0 - 6
+                    if new_x1 - clipped.x0 >= min_width:
+                        clipped.x1 = min(clipped.x1, new_x1)
+
+        if clipped.width < min_width or clipped.height < min_height:
+            return fitz.Rect(rect)
+        return clipped
 
     def analyze_pdf(self, input_path):
         """分析PDF文件，返回页数、字数、语言等信息"""
@@ -1213,7 +1387,8 @@ class PDFTranslator:
                 "严格要求：\n"
                 "1. 只返回译文，不要解释、注释、括号说明或前后缀。\n"
                 "2. 保留项目符号、URL、数字、章节号和专有名词格式。\n"
-                "3. 如果原文已经是目标语言或不需要翻译，原样返回。\n\n"
+                "3. 不得新增原文没有的项目符号、编号列表、示例、脚注或说明。\n"
+                "4. 如果原文已经是目标语言或不需要翻译，原样返回。\n\n"
                 f"{text}"
             )
 
@@ -1246,8 +1421,9 @@ class PDFTranslator:
                         f"把下面英文完整翻译成{target_lang_name}。\n"
                         "严格要求：\n"
                         "1. 除 URL、页码、专有名词外，不得保留整句英文。\n"
-                        "2. 只返回译文，不要解释。\n"
-                        "3. 保留项目符号和原有换行。\n\n"
+                        "2. 不得新增原文没有的项目符号、编号列表、示例、脚注或说明。\n"
+                        "3. 只返回译文，不要解释。\n"
+                        "4. 保留项目符号和原有换行。\n\n"
                         f"{text}"
                     )
                     retry_data = {
@@ -2431,24 +2607,32 @@ class PDFTranslator:
                             heading_fonts = [name for name in ('ui_heiti', 'ui_unicode', 'ui_cjk', 'helv-bold', 'helv') if name in font_names or name in page_registered_fonts]
                             font_names = heading_fonts + [name for name in font_names if name not in heading_fonts]
 
-                        # 标题、图注和短标签优先保留原始字号，正文再适度缩小。
+                        # 优先保留原字号，只有在文本框容纳不下时才渐进缩小。
                         if layout_hint in ('caption', 'heading', 'short'):
                             if is_chinese:
-                                base_fontsize = max(10, original_size * 1.02)
+                                base_fontsize = max(10, original_size * 1.04)
                             else:
                                 base_fontsize = max(10, original_size)
                         elif layout_hint in ('list_item', 'list_cont'):
                             if is_chinese:
-                                base_fontsize = max(7, original_size * 0.95)
+                                base_fontsize = max(9, original_size * 1.0)
                             else:
-                                base_fontsize = max(7, original_size * 0.98)
+                                base_fontsize = max(8, original_size * 1.0)
                         elif is_chinese:
-                            base_fontsize = max(6, original_size * 0.88)
+                            base_fontsize = max(9, original_size * 1.0)
                         else:
-                            base_fontsize = max(6, original_size * 0.95)
+                            base_fontsize = max(8, original_size * 0.98)
                         if layout_hint == 'toc':
-                            base_fontsize = max(6, base_fontsize * 0.85)
-                        font_sizes = [base_fontsize, base_fontsize * 0.95, base_fontsize * 0.9, base_fontsize * 0.84, 6]
+                            base_fontsize = max(8, base_fontsize * 0.94)
+                        font_sizes = [
+                            base_fontsize,
+                            base_fontsize * 0.98,
+                            base_fontsize * 0.95,
+                            base_fontsize * 0.92,
+                            base_fontsize * 0.88,
+                            base_fontsize * 0.82,
+                            max(7, base_fontsize * 0.76),
+                        ]
                         original_color = font_info.get('color', 0)
                         if self._looks_light_color(original_color):
                             text_color = self._pdf_color_to_rgb(original_color)
@@ -2459,22 +2643,19 @@ class PDFTranslator:
                         next_top = None
                         if idx + 1 < len(page_translations):
                             next_top = page_translations[idx + 1][0].y0
-                        max_expand_bottom = page_bottom if next_top is None else max(text_rect.y1, next_top - 4)
-                        expanded_rect = fitz.Rect(text_rect)
+                        expanded_rect = self._expand_text_rect(
+                            text_rect,
+                            layout_hint,
+                            original_size,
+                            new_page.rect,
+                            page_bottom,
+                            next_top,
+                            image_rects,
+                        )
                         if layout_hint in ('caption', 'heading', 'short') and self._looks_light_color(original_color):
-                            expanded_rect = fitz.Rect(
-                                text_rect.x0,
-                                text_rect.y0,
-                                new_page.rect.width - 72,
-                                min(max_expand_bottom, max(text_rect.y1 + original_size * 1.6, text_rect.y1))
-                            )
-                        elif layout_hint in ('list_item', 'list_cont'):
-                            expanded_rect = fitz.Rect(
-                                text_rect.x0,
-                                text_rect.y0,
-                                text_rect.x1,
-                                min(max_expand_bottom, max(text_rect.y1 + original_size * 2.2, text_rect.y1))
-                            )
+                            expanded_rect.x1 = max(expanded_rect.x1, new_page.rect.width - 72)
+                        safe_text_rect = self._clip_rect_to_avoid_images(text_rect, image_rects)
+                        safe_expanded_rect = self._clip_rect_to_avoid_images(expanded_rect, image_rects)
 
                         for font_name in font_names:
                             single_line_heading = (
@@ -2482,7 +2663,12 @@ class PDFTranslator:
                                 and '\n' not in translated_text
                                 and len(translated_text) <= 80
                             )
-                            if single_line_heading:
+                            heading_anchor_rect = safe_text_rect
+                            heading_hits_image = any(
+                                not (heading_anchor_rect & image_rect).is_empty and (heading_anchor_rect & image_rect).get_area() > 20
+                                for image_rect in image_rects
+                            )
+                            if single_line_heading and not heading_hits_image:
                                 for fontsize in font_sizes[:-1]:
                                     try:
                                         if layout_hint in ('caption', 'heading', 'short') or (layout_hint == 'toc' and len(translated_text) <= 32):
@@ -2490,7 +2676,7 @@ class PDFTranslator:
                                         else:
                                             draw_font = font_name
                                         new_page.insert_text(
-                                            (text_rect.x0, text_rect.y0 + fontsize),
+                                            (heading_anchor_rect.x0, heading_anchor_rect.y0 + fontsize),
                                             translated_text,
                                             fontsize=fontsize,
                                             fontname=draw_font,
@@ -2503,9 +2689,14 @@ class PDFTranslator:
                                 if written:
                                     break
 
-                            rect_variants = [text_rect]
-                            if expanded_rect != text_rect:
-                                rect_variants.append(expanded_rect)
+                            rect_variants = [safe_text_rect]
+                            if safe_expanded_rect != safe_text_rect:
+                                rect_variants.append(safe_expanded_rect)
+                            if safe_expanded_rect != safe_text_rect:
+                                wide_rect = fitz.Rect(safe_text_rect.x0, safe_text_rect.y0, safe_expanded_rect.x1, safe_text_rect.y1)
+                                wide_rect = self._clip_rect_to_avoid_images(wide_rect, image_rects)
+                                if wide_rect != safe_text_rect and wide_rect != safe_expanded_rect:
+                                    rect_variants.insert(1, wide_rect)
                             for candidate_rect in rect_variants:
                                 for fontsize in font_sizes:
                                     try:
@@ -2529,11 +2720,12 @@ class PDFTranslator:
 
                             if not written:
                                 try:
-                                    extended_rect = fitz.Rect(text_rect.x0, text_rect.y0, expanded_rect.x1, min(max_expand_bottom, page_bottom))
+                                    extended_rect = fitz.Rect(safe_text_rect.x0, safe_text_rect.y0, safe_expanded_rect.x1, safe_expanded_rect.y1)
+                                    extended_rect = self._clip_rect_to_avoid_images(extended_rect, image_rects)
                                     result = new_page.insert_textbox(
                                         extended_rect,
                                         translated_text,
-                                        fontsize=6,
+                                        fontsize=max(7, base_fontsize * 0.72),
                                         fontname=font_name,
                                         color=text_color,
                                         align=0
@@ -2550,11 +2742,17 @@ class PDFTranslator:
                         else:
                             # 最后兜底：在矩形起点强制插入单行文本，避免丢失
                             try:
+                                fallback_font = "helv"
+                                if is_chinese:
+                                    for preferred in ("ui_unicode", "ui_heiti", "ui_cjk"):
+                                        if preferred in page_registered_fonts:
+                                            fallback_font = preferred
+                                            break
                                 new_page.insert_text(
-                                    (text_rect.x0, text_rect.y0 + 10),
+                                    (safe_text_rect.x0, safe_text_rect.y0 + 10),
                                     translated_text,
-                                    fontsize=6,
-                                    fontname="helv",
+                                    fontsize=max(7, base_fontsize * 0.72),
+                                    fontname=fallback_font,
                                     color=text_color
                                 )
                                 success_count += 1
