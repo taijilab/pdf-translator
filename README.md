@@ -1,6 +1,6 @@
 # PDF 翻译工具
 
-一个功能强大的PDF文件翻译Web应用，支持多种翻译API，实时进度显示和翻译日志。
+一个面向本地/轻量部署场景的 PDF 翻译 Web 应用，支持多种翻译服务、文件分析、术语库、实时进度和翻译结果预览。
 
 ## 功能特点
 
@@ -8,17 +8,25 @@
 - **Google Translate** (免费，无需API密钥)
 - **DeepSeek API** (高质量AI翻译，需要API密钥)
 - **OpenRouter (DeepSeek)** (统一接口，需要API密钥)
+- **Kimi via OpenRouter** (更偏中文长文本，需要API密钥)
+- **GPT via OpenRouter** (高质量通用模型，需要API密钥)
 - **智谱AI API** (GLM-4模型，需要API密钥)
 
 ### 核心功能
+- 支持 **PDF 保真翻译** 和 **TXT 纯文本翻译**
 - 支持多种语言之间的翻译
 - 支持自动检测源语言
+- **上传前文件分析** - 统计页数、字数、语言和预计时长
+- **术语库管理** - 支持全局术语库、文件术语库、导入/导出和推荐术语
 - **实时进度显示** - 显示当前翻译进度百分比
 - **翻译日志窗口** - 实时显示翻译过程中的详细信息
+- **翻译任务取消** - 可中途终止长任务
 - 友好的Web界面，支持拖拽上传
+- 翻译完成后支持 **预览和下载**
 - 尽量保持PDF原有格式
 - 支持中文、日文、韩文等多字节字符
-- 最大支持50MB的PDF文件
+- 页面展示版本号和构建信息
+- 最大支持200MB的PDF文件
 
 ### 实时进度和日志
 - **进度条** - 可视化显示翻译进度
@@ -65,14 +73,15 @@ python app.py
 2. 选择翻译服务：
    - **Google Translate**: 直接使用，无需配置
    - **DeepSeek API**: 需要输入API密钥（从 https://platform.deepseek.com 获取）
-   - **OpenRouter**: 需要输入API密钥（从 https://openrouter.ai 获取）
+   - **OpenRouter / Kimi / GPT**: 需要输入API密钥（从 https://openrouter.ai 获取）
    - **智谱AI API**: 需要输入API密钥（从 https://open.bigmodel.cn 获取）
 3. 点击或拖拽上传PDF文件
-4. 选择源语言（可设置为"自动检测"）
-5. 选择目标语言
-6. 点击"开始翻译"按钮
-7. **实时观察翻译进度和日志**
-8. 翻译完成后自动下载翻译后的PDF
+4. 查看文件分析结果，并按需调整术语库
+5. 选择输出格式（PDF 或 TXT）
+6. 选择源语言、目标语言和并发数
+7. 点击"开始翻译"按钮
+8. **实时观察翻译进度、Token/费用和日志**
+9. 翻译完成后预览或下载结果文件
 
 ## API密钥获取
 
@@ -104,23 +113,25 @@ pdfapp/
 ├── requirements.txt    # Python依赖
 ├── start.sh           # 快速启动脚本
 ├── example_usage.py   # 命令行使用示例
+├── glossaries/        # 文件级术语库
 ├── templates/         # HTML模板
-│   └── index.html    # Web界面（含进度和日志显示）
+│   └── index.html    # Web界面（含分析、术语库、进度和预览）
 └── static/           # 静态资源
     ├── css/
     │   └── style.css # 样式文件
     └── js/
-        └── app.js    # 前端交互（SSE连接）
+        └── app.js    # 前端交互（SSE、术语库、预览）
 ```
 
 ## 技术栈
 
 - **后端**: Python Flask
 - **实时通信**: Server-Sent Events (SSE)
-- **PDF处理**: PyPDF2, ReportLab
+- **PDF处理**: PyMuPDF
 - **翻译服务**:
-  - Google Translate (googletrans)
+  - Google Translate (deep-translator)
   - DeepSeek API (requests)
+  - OpenRouter API (DeepSeek / Kimi / GPT)
   - 智谱AI API (requests)
 - **前端**: HTML5, CSS3, JavaScript (原生)
 
@@ -157,26 +168,34 @@ pdfapp/
 - 支持点击选择文件
 - 支持拖拽上传
 - 显示文件名和大小
+- 上传后自动分析页数、字数和语言
 
 ### 进度显示区
 - **进度头部**: 显示标题和百分比
 - **进度条**: 可视化进度展示
 - **状态文本**: 当前状态描述
+- **时间统计**: 已用时间和预计剩余
+- **Token统计**: 输入/输出 tokens 和预估费用
 - **翻译日志窗口**:
-  - 时间戳
   - 彩色编码的日志条目
   - 自动滚动到最新日志
 
+### 术语库区
+- 支持全局术语库和文件术语库
+- 支持推荐术语、导入、导出、删除和保存
+- 翻译时自动保护术语，减少误译
+
 ## 注意事项
 
-1. **API密钥安全**: 您的API密钥仅用于本次翻译，不会被存储
+1. **API密钥安全**: API密钥不会存储在服务端；当前前端也不会持久化到浏览器本地存储
 2. **翻译质量**:
    - Google Translate: 免费但质量一般
-   - DeepSeek/智谱AI: 需要付费但质量更高
+   - DeepSeek / Kimi / GPT / 智谱AI: 需要付费但质量更高
 3. **格式保持**: 尽量保持原有格式，但复杂的布局可能需要手动调整
-4. **文件大小**: 最大支持50MB的PDF文件
+4. **文件大小**: 最大支持200MB的PDF文件
 5. **处理时间**: 翻译时间取决于PDF的大小、页数和选择的API
 6. **网络连接**: 需要稳定的网络连接
+7. **部署限制**: 当前任务队列和取消状态存于内存，生产部署建议使用单进程模式
 
 ## 常见问题
 
